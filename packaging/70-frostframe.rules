@@ -1,0 +1,4 @@
+# frostframe: AIO cooler LCD screens (USB vendor 391a, printer-class interface handled by usblp).
+# Gives the logged-in user access and a stable name /dev/frostframe-<product id>.
+SUBSYSTEM=="usb", ATTR{idVendor}=="391a", TAG+="uaccess", ENV{ID_MM_DEVICE_IGNORE}="1"
+SUBSYSTEM=="usbmisc", KERNEL=="lp*", ATTRS{idVendor}=="391a", TAG+="uaccess", SYMLINK+="frostframe-$attr{idProduct}"

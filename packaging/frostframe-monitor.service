@@ -1,0 +1,11 @@
+[Unit]
+Description=frostframe: keep cooler screen labels updated with live system readings
+After=graphical-session.target
+
+[Service]
+ExecStart=%h/.local/bin/frostframe monitor
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

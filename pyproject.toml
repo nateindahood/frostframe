@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "frostframe"
+version = "0.1.0"
+description = "Control AIO cooler LCD screens on Linux: media, live system stats, brightness, fan settings"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.8"
+dependencies = []
+classifiers = [
+    "Operating System :: POSIX :: Linux",
+    "Environment :: Console",
+    "Topic :: System :: Hardware",
+]
+
+[project.scripts]
+frostframe = "frostframe.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/nateindahood/frostframe"
+
+[tool.setuptools.packages.find]
+where = ["src"]
