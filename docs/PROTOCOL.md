@@ -49,7 +49,7 @@ implementation of these messages is in `src/frostframe/protocol.py`.
 | 403 | file_remove | | |
 | 407–409 | media_push_begin/data/end | `{payload_format, frame_rate, width, height}` / data | live streaming to the screen (not yet tested) |
 | 420 | host_ctl_set_volume | `{volume}` | vendor sends it; this device answers BodyCaseNotSupported |
-| 450 | sys_ctl_exec | `{cmd: "Reboot" / "InstallApp", params}` | **don't** use casually |
+| 450 | sys_ctl_exec | `{cmd: "Reboot" / "InstallApp", params}` | **don't use**: on firmware v2.0.6, `Reboot` restarts the screen into Rockchip loader mode (USB `2207:350a`) and it stays there until a full power cycle (PSU off) |
 
 (Fields 404–406 are for the vendor's encrypted store content and pulling files; 451, 900, 999 are
 serial-number/factory/debug functions. Out of scope.)

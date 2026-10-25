@@ -128,6 +128,14 @@ COOLER_CONFIG = {
 }
 COOLER_STATUS = {1: ("fan_rpm", "uint", None), 2: ("pump_rpm", "uint", None)}
 
+# ------------------------------------------------------------- system ctl ---
+
+# Not exposed in the CLI: on the tested firmware, "Reboot" restarts the screen into its Rockchip
+# flashing (loader) mode, where it stays until the PC's power supply is switched off and on.
+SYS_COMMANDS = {"None": 0, "InstallApp": 1, "Reboot": 2, "RestoreConfig": 3, "RestoreDevice": 4,
+                "Console": 5, "Reset": 6}
+SYS_EXEC = {1: ("cmd", "enum", SYS_COMMANDS), 2: ("params", "string", None)}
+
 # ---------------------------------------------------------------- packets ---
 # Request: header (1) + one body field. Response: header (1) + error (2) + one body field.
 
@@ -152,6 +160,7 @@ REQUESTS = {
     "file_data": (401, FILE_DATA),
     "file_end": (402, FILE_END),
     "file_remove": (403, FILE_REMOVE),
+    "sys_exec": (450, SYS_EXEC),
 }
 
 RESPONSES = {
@@ -169,6 +178,7 @@ RESPONSES = {
     800: ("file_begin_status", FILE_STATUS),
     801: ("file_data_status", FILE_STATUS),
     802: ("file_end_status", FILE_STATUS),
+    850: ("sys_exec_result", {1: ("status", "uint", None), 2: ("message", "string", None)}),
     822: ("app_exception", {1: ("type", "uint", None), 2: ("error_code", "sint", None),
                             3: ("source", "string", None), 4: ("message", "string", None)}),
 }

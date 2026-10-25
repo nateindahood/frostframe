@@ -116,6 +116,10 @@ def cmd_files(args):
         playing = {current.get("kaleidoscope_file")}
     else:
         playing = {current.get("single_file")}
+    on_device = {os.path.basename(f.get("path", "")) for k in ("media", "presets") for f in fl.get(k, [])}
+    for missing in sorted(playing - on_device - {None, ""}):
+        print("! The screen is set to play %s, which is no longer on the device (black screen).\n"
+              "  Pick another file with `frostframe play NAME`." % missing)
     for title, key in (("Your files", "media"), ("Built-in presets", "presets")):
         items = fl.get(key, [])
         print("%s (%d):" % (title, len(items)))
@@ -330,6 +334,16 @@ def cmd_doctor(args):
             with open_device(args) as dev:
                 info = dev.device_info()
                 print("✔ talking to the screen: %s firmware %s" % (info.get("product_name"), info.get("firmware_version")))
+                work = dev.user_config().get("work", {})
+                fl = dev.file_list()
+                on_device = {os.path.basename(f.get("path", "")) for k in ("media", "presets") for f in fl.get(k, [])}
+                mode = work.get("media_mode", "Single")
+                wanted = ([work.get("left_file"), work.get("right_file")] if mode == "Dual"
+                          else [work.get("kaleidoscope_file")] if mode == "Kaleidoscope" else [work.get("single_file")])
+                for w in wanted:
+                    if w and w not in on_device:
+                        print("✘ set to play %s, which isn't on the device (black screen): use `frostframe play`" % w)
+                        ok = False
         except DeviceError as e:
             print("✘ %s" % e)
             ok = False
