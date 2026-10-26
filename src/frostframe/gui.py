@@ -515,6 +515,10 @@ class Window(Gtk.ApplicationWindow):
             b.set_tooltip_text(tip)
             b.connect("clicked", cb)
             box.pack_start(b, False, False, 0)
+        save = Gtk.Button.new_from_icon_name("document-save-symbolic", Gtk.IconSize.BUTTON)
+        save.set_tooltip_text("Save a copy to your library (as .mp4)")
+        save.connect("clicked", lambda *_: self._save_to_library(name))
+        box.pack_start(save, False, False, 0)
         d = Gtk.Button.new_from_icon_name("user-trash-symbolic", Gtk.IconSize.BUTTON)
         if deletable:
             d.set_tooltip_text("Delete from the screen")
@@ -525,6 +529,12 @@ class Window(Gtk.ApplicationWindow):
         box.pack_start(d, False, False, 0)
         row.add(box)
         return row
+
+    def _save_to_library(self, name):
+        folder = self._library_path()
+        self.run(lambda: self._with_dev(lambda d: cli.save_to_library(d, name, folder)),
+                 lambda out: (self.status.set_text("Saved %s to your library." % os.path.basename(out)),
+                              self.refresh_library()), "Saving %s to your library…" % name)
 
     def _loop_mode(self):
         return {"single": "Single", "all": "MediaAll", "random": "MediaRand"}[self.loop_combo.get_active_id()]

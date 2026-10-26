@@ -194,18 +194,41 @@ def cmd_rm(args):
         print("Removed %s" % name)
 
 
+def save_to_library(dev, name, folder, progress=None):
+    """Pull a file from the screen and save it into the library as a playable .mp4."""
+    stem = name.split(".h264_")[0]
+    stem = os.path.splitext(stem)[0] if stem.lower().endswith((".mp4", ".gif", ".png", ".jpg", ".jpeg")) else stem
+    out = os.path.join(folder, stem + ".mp4")
+    n = 2
+    while os.path.exists(out):
+        out = os.path.join(folder, "%s (%d).mp4" % (stem, n))
+        n += 1
+    return media.extract_mp4(dev.pull(name, progress=progress), out)
+
+
 def cmd_pull(args):
     with open_device(args) as dev:
-        name = resolve_file(dev, args.name)
-        data = dev.pull(name, progress=progress_bar)
-    out = args.output or name
-    if args.video:
-        r = media.extract_mp4(data, out if out.endswith(".mp4") else out + ".mp4")
-        print("Saved %s" % r)
-    else:
-        with open(out, "wb") as f:
-            f.write(data)
-        print("Saved %s (%.1f MB)" % (out, len(data) / 1e6))
+        names = [resolve_file(dev, n) for n in args.names]
+        if args.presets:
+            names += all_files(dev)[1]
+        if not names:
+            raise DeviceError("give file names, or --presets for all built-in clips")
+        if args.library:
+            folder = library.library_dir(load_config())
+            for name in names:
+                print("%s -> %s" % (name, save_to_library(dev, name, folder)))
+            return
+        if len(names) > 1 and args.output:
+            raise DeviceError("-o only works with a single file")
+        for name in names:
+            data = dev.pull(name, progress=progress_bar if len(names) == 1 else None)
+            out = args.output or name
+            if args.video:
+                out = media.extract_mp4(data, out if out.endswith(".mp4") else out + ".mp4")
+            else:
+                with open(out, "wb") as f:
+                    f.write(data)
+            print("Saved %s" % out)
 
 
 def cmd_library(args):
@@ -427,9 +450,11 @@ def main(argv=None):
     s.add_argument("--loop", choices=["single", "all", "random", "presets", "random-presets"], default="single")
     s.set_defaults(func=cmd_play)
 
-    s = sub.add_parser("pull", help="download a file from the screen")
-    s.add_argument("name")
-    s.add_argument("-o", "--output", help="output file (default: the device file name)")
+    s = sub.add_parser("pull", help="download files from the screen")
+    s.add_argument("names", nargs="*", metavar="NAME")
+    s.add_argument("--presets", action="store_true", help="all built-in clips")
+    s.add_argument("--library", action="store_true", help="save as .mp4 into your library")
+    s.add_argument("-o", "--output", help="output file (single file only)")
     s.add_argument("--video", action="store_true", help="save as a playable .mp4 instead of the raw device file")
     s.set_defaults(func=cmd_pull)
 

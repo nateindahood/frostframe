@@ -87,6 +87,7 @@ you still need the udev rule from `packaging/`.
 | `frostframe upload FILE [--play]` | Convert (ffmpeg) and upload a GIF, MP4, PNG or JPEG (path or library file name) |
 | `frostframe library [add FILE... \| path]` | Your local media folder |
 | `frostframe pull NAME [--video]` | Download a file from the screen (`--video`: as a playable .mp4) |
+| `frostframe pull --presets --library` | Save the screen's built-in clips into your library |
 | `frostframe upload FILE --half --play --side right` | Half-width clip for dual-screen mode |
 | `frostframe play NAME` | Play a file (full name or unique prefix, e.g. `default_03`) |
 | `frostframe play --left A --right B` | Dual-screen mode, two clips side by side |
@@ -108,6 +109,11 @@ Label options: `--color white|cyan|#ff8800|...` (any RGB color), `--font roboto-
 gpu-clock gpu-power ram net-down net-up time date`.
 
 ## Good to know
+
+- **Can frostframe include the manufacturer's animations?** No, they belong to the
+  manufacturer. But you can save your own copies of the clips on your screen, and of other
+  clips you already have, into your library: see
+  [Using the clips that came with your cooler](docs/vendor-media.md).
 
 - **One program at a time.** Linux's printer driver lets only one program open the screen. Quit
   the vendor app (or Wine) before using frostframe. frostframe's own commands take turns, so you
