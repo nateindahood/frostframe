@@ -29,9 +29,11 @@ echo "==> Installing to $LIB"
 rm -rf "$LIB"
 mkdir -p "$LIB" "$(dirname "$BIN")"
 cp -r "$HERE/src/frostframe" "$LIB/"
+# The library path is passed as an argument (shell-quoted), never pasted into Python code.
+LIB_QUOTED="'$(printf '%s' "$LIB" | sed "s/'/'\\\\''/g")'"
 cat >"$BIN" <<EOF
 #!/bin/sh
-exec python3 -I -c "import sys; sys.path.insert(0, '$LIB'); from frostframe.cli import main; sys.exit(main(sys.argv[1:]))" "\$@"
+exec python3 -I -c 'import sys; sys.path.insert(0, sys.argv.pop(1)); from frostframe.cli import main; sys.exit(main(sys.argv[1:]))' $LIB_QUOTED "\$@"
 EOF
 chmod +x "$BIN"
 mkdir -p "$APPS"

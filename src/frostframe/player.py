@@ -33,20 +33,6 @@ CACHE = os.path.join(os.environ.get("XDG_CACHE_HOME", os.path.expanduser("~/.cac
 
 # ------------------------------------------------------------- durations ---
 
-def count_frames_any(stream):
-    """Frames in an H.264 Annex-B stream: AUDs if present, else slices that start a picture."""
-    aud = slices = 0
-    i = stream.find(b"\x00\x00\x01")
-    while i >= 0 and i + 4 < len(stream):
-        t = stream[i + 3] & 0x1F
-        if t == 9:
-            aud += 1
-        elif t in (1, 5) and stream[i + 4] & 0x80:   # first_mb_in_slice == 0
-            slices += 1
-        i = stream.find(b"\x00\x00\x01", i + 3)
-    return aud or slices
-
-
 def duration_from_file(data):
     """Seconds of a device media file (with or without frostframe's media header)."""
     fps = 30
@@ -59,15 +45,18 @@ def duration_from_file(data):
             data = data[4 + struct.unpack("<I", data[:4])[0]:]
         except Exception:
             pass
-    frames = count_frames_any(data)
+    frames = media.count_frames(data)
     return frames / float(fps) if frames else DEFAULT_SECONDS
 
 
 class Durations:
     """Clip lengths by device file name, cached on disk (name + size identify a file)."""
 
+    RETRY_SECONDS = 60
+
     def __init__(self, fetch):
         self.fetch = fetch        # fetch(name, limit=None) -> bytes from the device
+        self.failed = {}          # key -> time of the last failed lookup
         try:
             with open(CACHE) as f:
                 self.cache = json.load(f)
@@ -77,13 +66,23 @@ class Durations:
     def get(self, name, size):
         key = "%s|%d" % (name, size)
         if key not in self.cache:
-            data = self.fetch(name, limit=65536)          # header is enough for our uploads
-            if data.startswith(b"\x00\x00"):               # headerless (built-in): count frames
-                data = self.fetch(name)
+            if time.monotonic() - self.failed.get(key, -1e9) < self.RETRY_SECONDS:
+                return DEFAULT_SECONDS
+            try:
+                data = self.fetch(name, limit=65536)          # header is enough for our uploads
+                if data.startswith(b"\x00\x00"):               # headerless (built-in): count frames
+                    data = self.fetch(name)
+            except Exception:       # e.g. the file was just deleted: guess, retry later
+                self.failed[key] = time.monotonic()
+                return DEFAULT_SECONDS
             self.cache[key] = round(duration_from_file(data), 3)
-            os.makedirs(os.path.dirname(CACHE), exist_ok=True)
-            with open(CACHE, "w") as f:
-                json.dump(self.cache, f)
+            try:
+                os.makedirs(os.path.dirname(CACHE), exist_ok=True)
+                with open(CACHE + ".tmp", "w") as f:
+                    json.dump(self.cache, f)
+                os.replace(CACHE + ".tmp", CACHE)
+            except OSError:
+                pass
         return self.cache[key]
 
 
@@ -93,14 +92,29 @@ class PlaylistRun:
     """Walks one playlist: each item plays `repeats` times, then the next (wrapping around)."""
 
     def __init__(self, playlist, available, duration, now):
-        items = [it for it in playlist.get("items", []) if it.get("file") in available]
-        self.items = items
+        self.items = [it for it in playlist.get("items", []) if it.get("file") in available]
         self.shuffle = bool(playlist.get("shuffle"))
         self.duration = duration
         self.order = []
         self.pos = -1
         self.started = now
         self._next(now)
+
+    def update(self, playlist, available, now):
+        """The playlist was edited or files came and went: carry on with the current clip
+        if it's still there (and still counting its plays), else start the next one."""
+        cur = self.current()
+        self.items = [it for it in playlist.get("items", []) if it.get("file") in available]
+        self.shuffle = bool(playlist.get("shuffle"))
+        self.order = list(range(len(self.items)))
+        if self.shuffle:
+            random.shuffle(self.order)
+        same = [i for i, it in enumerate(self.items) if cur and it.get("file") == cur.get("file")]
+        if same:
+            self.pos = self.order.index(same[0])
+        else:
+            self.pos = -1
+            self._next(now)
 
     def _next(self, now):
         if not self.items:
@@ -150,6 +164,7 @@ class Engine:
         self.active_rule = None         # index of the rule in effect (None = "otherwise")
         self.pending = None             # (rule index, since) waiting out the hold time
         self.state = {}
+        self._playlist_sig = None       # what the running playlist was built from
 
     def _rule_matches(self, rule, readings, active):
         v = readings.get(rule.get("metric"))
@@ -197,13 +212,15 @@ class Engine:
         if not target:
             self.state = {"mode": mode, "note": "nothing to play"}
             return None
-        if target != self.source:
+        pl = cfg.get("playlists", {}).get(target[9:]) if target.startswith("playlist:") else None
+        sig = (json.dumps(pl, sort_keys=True), frozenset(available)) if pl else None
+        if target != self.source or sig != self._playlist_sig:
+            if target == self.source and pl and self.run:
+                self.run.update(pl, available, now)
+            else:
+                self.run = PlaylistRun(pl, available, self.duration, now) if pl else None
             self.source = target
-            self.run = None
-            if target.startswith("playlist:"):
-                pl = cfg.get("playlists", {}).get(target[9:])
-                if pl:
-                    self.run = PlaylistRun(pl, available, self.duration, now)
+        self._playlist_sig = sig
         if target.startswith("file:"):
             f = target[5:]
             self.state = {"mode": mode, "source": target, "file": f, "rule": self.active_rule}

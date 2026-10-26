@@ -111,7 +111,8 @@ you still need the udev rule from `packaging/`.
 | `frostframe dump` | All device settings as JSON |
 
 Upload options: `--fit fill` (crop to fill, default), `--fit fit` (letterbox), `--fit stretch`,
-`--seconds N` (trim long videos), `--quality N` (x264 CRF, default 23; lower is sharper and larger).
+`--seconds N` (videos are cut to the first 60 s by default; `--seconds 0` for no limit; every
+frame is stored as a keyframe, about 3 MB per second), `--quality N` (x264 CRF, default 23; lower is sharper and larger).
 
 Label options: `--color white|cyan|#ff8800|...` (any RGB color), `--font roboto-regular|BitcountSingle-Regular|Orbitron-Regular|RubikGlitch-Regular`,
 `--side left|right|full`, `--size 160`. Metrics: `cpu-temp cpu-load cpu-clock gpu-temp gpu-load
@@ -154,6 +155,9 @@ them a repeat count (e.g. `:3`) so each one stays up a little longer.
 - **One program at a time.** Linux's printer driver lets only one program open the screen. Quit
   the vendor app (or Wine) before using frostframe. frostframe's own commands take turns, so you
   can run `frostframe play ...` while the monitor service is running.
+- **Fan and pump speeds have a safety floor.** frostframe refuses pump speeds below 50 % and fan
+  speeds below 20 % unless you add `--force` (the GUI asks first), since the cooler might then
+  not keep the CPU cool enough.
 - **Fan and pump settings only matter if the fans/pump are wired to the cooler.** If
   `frostframe cooler` shows 0 RPM, they're probably on motherboard headers; control them in the
   BIOS or with your motherboard's Linux tools instead.

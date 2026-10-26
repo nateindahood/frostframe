@@ -18,6 +18,9 @@ from . import wire
 FPS = 30
 TYPES = {".gif": "GIF", ".png": "PNG", ".jpg": "JPEG", ".jpeg": "JPEG", ".mp4": "MP4"}
 IMAGE_SECONDS = 2  # still images become a short looping clip
+# Videos are cut to this length unless asked otherwise: every frame is a keyframe, so the
+# device format takes about 3 MB per second, all of it held in memory while uploading.
+DEFAULT_MAX_SECONDS = 60
 
 
 class MediaError(Exception):
@@ -55,8 +58,8 @@ def _video_filter(mode, width, height):
     raise MediaError("unknown fit mode %r (use fill, fit or stretch)" % mode)
 
 
-def convert(src, width, height, mode="fill", max_seconds=None, quality=23):
-    """Return (device_file_name, file_bytes) ready for upload."""
+def convert(src, width, height, mode="fill", max_seconds=DEFAULT_MAX_SECONDS, quality=23):
+    """Return (device_file_name, file_bytes) ready for upload. max_seconds=0/None: no limit."""
     if not os.path.isfile(src):
         raise MediaError("file not found: %s" % src)
     ext = os.path.splitext(src)[1].lower()
@@ -80,7 +83,8 @@ def convert(src, width, height, mode="fill", max_seconds=None, quality=23):
         r = subprocess.run(cmd + [out], capture_output=True, text=True)
         if r.returncode != 0:
             raise MediaError("ffmpeg failed: %s" % (r.stderr.strip()[-500:] or r.returncode))
-        payload = open(out, "rb").read()
+        with open(out, "rb") as f:
+            payload = f.read()
     frames = count_frames(payload)
     if frames == 0:
         raise MediaError("conversion produced no video frames")
@@ -99,18 +103,22 @@ def convert(src, width, height, mode="fill", max_seconds=None, quality=23):
 
 
 def count_frames(stream):
-    """Count access units (AUD NAL units) in an Annex-B stream."""
-    n = 0
+    """Frames in an H.264 Annex-B stream: AUDs if present, else slices that start a picture."""
+    aud = slices = 0
     i = stream.find(b"\x00\x00\x01")
-    while i >= 0:
-        if i + 3 < len(stream) and stream[i + 3] & 0x1F == 9:
-            n += 1
+    while i >= 0 and i + 4 < len(stream):
+        t = stream[i + 3] & 0x1F
+        if t == 9:
+            aud += 1
+        elif t in (1, 5) and stream[i + 4] & 0x80:   # first_mb_in_slice == 0
+            slices += 1
         i = stream.find(b"\x00\x00\x01", i + 3)
-    return n
+    return aud or slices
 
 
 def extract_mp4(device_file, out):
     """Turn a device media file (header + raw H.264) into a playable .mp4 (no re-encode)."""
+    out = os.path.abspath(out)    # never let a name starting with "-" look like an option
     r = subprocess.run([ffmpeg_path(), "-hide_banner", "-loglevel", "error", "-y", "-f", "h264", "-r", str(FPS),
                         "-i", "pipe:0", "-c", "copy", out], input=device_file, capture_output=True)
     if r.returncode != 0:

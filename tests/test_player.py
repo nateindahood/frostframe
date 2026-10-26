@@ -6,7 +6,7 @@ import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
-from frostframe import player  # noqa: E402
+from frostframe import media, player  # noqa: E402
 
 DUR = {"a": 2.0, "b": 3.0, "c": 4.0, "hot": 5.0, "cool": 5.0}
 AVAILABLE = set(DUR)
@@ -41,6 +41,30 @@ class PlaylistTests(unittest.TestCase):
                "playlists": {"p": {"items": [{"file": "gone"}, {"file": "b"}]}}}
         e = player.Engine(DUR.get)
         self.assertEqual(set(run(e, cfg, 5)), {"b"})
+
+    def test_edits_apply_while_playing(self):
+        cfg = {"playback": {"mode": "playlist", "playlist": "p"},
+               "playlists": {"p": {"items": [{"file": "a"}]}}}
+        e = player.Engine(DUR.get)
+        run(e, cfg, 3)
+        cfg["playlists"]["p"]["items"].append({"file": "b"})
+        self.assertIn("b", run(e, cfg, 10, start=3))
+
+    def test_edit_keeps_current_clip(self):
+        cfg = {"playback": {"mode": "playlist", "playlist": "p"},
+               "playlists": {"p": {"items": [{"file": "c"}, {"file": "a"}]}}}
+        e = player.Engine(DUR.get)
+        run(e, cfg, 2)                                   # 2 s into c's 4 s
+        cfg["playlists"]["p"]["items"].append({"file": "b"})
+        self.assertEqual(run(e, cfg, 3, start=2), ["c", "c", "a"])
+
+    def test_clip_deleted_while_playing_is_dropped(self):
+        cfg = {"playback": {"mode": "playlist", "playlist": "p"},
+               "playlists": {"p": {"items": [{"file": "a"}, {"file": "b"}]}}}
+        e = player.Engine(DUR.get)
+        e.tick(cfg, {}, {"a", "b"}, now=0)
+        out = [e.tick(cfg, {}, {"a"}, now=t) for t in range(1, 12)]
+        self.assertEqual(set(out), {"a"})
 
     def test_manual_mode_leaves_screen_alone(self):
         e = player.Engine(DUR.get)
@@ -85,7 +109,21 @@ class DurationTests(unittest.TestCase):
     def test_headerless_slices(self):
         # two pictures: IDR slice + P slice, each with first_mb_in_slice == 0 (top bit set)
         s = b"\x00\x00\x00\x01\x67\x4d" + b"\x00\x00\x00\x01\x65\x88" + b"\x00\x00\x00\x01\x41\x9a"
-        self.assertEqual(player.count_frames_any(s), 2)
+        self.assertEqual(media.count_frames(s), 2)
+
+
+class DurationLookupTests(unittest.TestCase):
+    def test_failed_lookup_guesses_and_waits_before_retrying(self):
+        calls = []
+
+        def fetch(name, limit=None):
+            calls.append(name)
+            raise OSError("gone")
+        d = player.Durations(fetch)
+        d.cache = {}
+        self.assertEqual(d.get("x", 1), player.DEFAULT_SECONDS)
+        self.assertEqual(d.get("x", 1), player.DEFAULT_SECONDS)
+        self.assertEqual(len(calls), 1)
 
 
 if __name__ == "__main__":

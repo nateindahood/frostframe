@@ -12,6 +12,7 @@ from . import wire
 
 VENDOR_ID = "391a"
 CHUNK_SIZE = 256 * 1024
+MAX_FRAME = 16 * 1024 * 1024    # largest reply we accept; real ones are well under 1 MiB
 
 
 class DeviceError(Exception):
@@ -24,14 +25,17 @@ def find_devices():
     for lp in sorted(glob.glob("/sys/class/usbmisc/lp*")):
         usb = os.path.realpath(os.path.join(lp, "device", ".."))
         try:
-            vid = open(os.path.join(usb, "idVendor")).read().strip()
-            pid = open(os.path.join(usb, "idProduct")).read().strip()
-            name = open(os.path.join(usb, "product")).read().strip()
+            vid, pid, name = (_read_attr(usb, a) for a in ("idVendor", "idProduct", "product"))
         except OSError:
             continue
         if vid == VENDOR_ID:
             found.append(("/dev/usb/" + os.path.basename(lp), pid, name))
     return found
+
+
+def _read_attr(usb, attr):
+    with open(os.path.join(usb, attr)) as f:
+        return f.read().strip()
 
 
 def crc32c(data):
@@ -132,6 +136,8 @@ class Device:
                 if time.monotonic() > deadline:
                     raise DeviceError("write timed out")
                 select.select([], [self.fd], [], 0.1)
+            except OSError as e:     # unplugged, USB reset, ...
+                raise DeviceError("lost connection to the screen: %s" % e.strerror)
 
     def _read_frame(self, timeout):
         deadline = time.monotonic() + timeout
@@ -142,6 +148,9 @@ class Device:
                     self._buf = self._buf[i:] if i > 0 else b""
                     continue
                 n = struct.unpack("<I", self._buf[4:8])[0]
+                if n > MAX_FRAME:
+                    self._buf = b""
+                    raise DeviceError("the screen sent an oversized reply (%d bytes)" % n)
                 if len(self._buf) >= 8 + n:
                     payload, self._buf = self._buf[8:8 + n], self._buf[8 + n:]
                     return payload
@@ -154,9 +163,24 @@ class Device:
                     chunk = os.read(self.fd, 1 << 20)
                 except BlockingIOError:
                     continue
+                except OSError as e:
+                    raise DeviceError("lost connection to the screen: %s" % e.strerror)
                 if not chunk:
                     time.sleep(0.01)
                 self._buf += chunk
+
+    def _drain(self):
+        """Drop anything already waiting, e.g. a late reply to a request that timed out,
+        so it can't be mistaken for the answer to the next one."""
+        self._buf = b""
+        while select.select([self.fd], [], [], 0)[0]:
+            try:
+                if not os.read(self.fd, 1 << 20):
+                    break
+            except BlockingIOError:
+                break
+            except OSError as e:
+                raise DeviceError("lost connection to the screen: %s" % e.strerror)
 
     # ----------------------------------------------------------- requests --
 
@@ -168,6 +192,7 @@ class Device:
             header["track_id"] = track_id
         payload = wire.encode({1: ("header", "msg", P.HEADER), num: (name, "msg", spec)},
                               {"header": header, name: body or {}})
+        self._drain()
         self._write_frame(payload)
         while True:
             rsp = wire.decode(P.RESPONSE_SPEC, self._read_frame(timeout or self.timeout))
@@ -193,10 +218,6 @@ class Device:
         self._get("get_sys_config", "sys_config")
         self._get("get_device_auth", "device_auth")
         return info
-
-    def ping(self):
-        kind, body = self.request("ping", {"payload": b"hello?"})
-        return body.get("payload", b"")
 
     def device_info(self):
         return self._get("get_device_info", "device_info")
@@ -271,6 +292,14 @@ class Device:
 
     def upload(self, name, data, file_type="media", progress=None):
         """Upload a prepared file (header + payload). Raises DeviceError on failure."""
+        try:
+            free = self.storage_status().get("available_bytes")
+        except DeviceError:
+            free = None
+        if free is not None and len(data) > free:
+            raise DeviceError("not enough space on the screen: %s needs %.1f MB, %.1f MB free. Delete "
+                              "something first, or make the clip shorter (--seconds)."
+                              % (name, len(data) / 1e6, free / 1e6))
         track = self._track = (self._track + 1) & 0xFFFFFFFF
         self._expect_status(self.request("file_begin", {"name": name.encode(), "size": len(data)},
                                          track_id=track), "file_begin_status")

@@ -17,6 +17,15 @@ from .device import Device, DeviceError, find_devices
 
 CONFIG_DIR = os.path.join(os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config")), "frostframe")
 CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
+# Rewritten every second by the monitor, so it lives in the per-user tmpfs, not on disk.
+STATE_FILE = os.path.join(os.environ.get("XDG_RUNTIME_DIR") or
+                          os.path.join(os.environ.get("XDG_CACHE_HOME", os.path.expanduser("~/.cache"))),
+                          "frostframe", "state.json")
+
+# Below these the AIO may not cool the CPU properly; going lower needs --force (CLI) or a
+# confirmation (GUI).
+PUMP_MIN_SAFE = 50
+FAN_MIN_SAFE = 20
 
 
 # ----------------------------------------------------------------- helpers ---
@@ -71,6 +80,16 @@ def resolve_file(dev, name):
     raise DeviceError("%r matches several files: %s" % (name, ", ".join(matches)))
 
 
+def playing_files(work):
+    """{file name: "playing" | "left" | "right"} for a user_config "work" section."""
+    mode = work.get("media_mode", "Single")
+    if mode == "Dual":
+        return {work.get("left_file"): "left", work.get("right_file"): "right"}
+    if mode == "Kaleidoscope":
+        return {work.get("kaleidoscope_file"): "playing"}
+    return {work.get("single_file"): "playing"}
+
+
 def update_user_config(dev, section, changes):
     cfg = dev.user_config()
     cfg.setdefault(section, {}).update(changes)
@@ -110,14 +129,7 @@ def cmd_info(args):
 def cmd_files(args):
     with open_device(args) as dev:
         fl = dev.file_list()
-        current = dev.user_config().get("work", {})
-    mode = current.get("media_mode", "Single")
-    if mode == "Dual":
-        playing = {current.get("left_file"), current.get("right_file")}
-    elif mode == "Kaleidoscope":
-        playing = {current.get("kaleidoscope_file")}
-    else:
-        playing = {current.get("single_file")}
+        playing = set(playing_files(dev.user_config().get("work", {})))
     on_device = {os.path.basename(f.get("path", "")) for k in ("media", "presets") for f in fl.get(k, [])}
     for missing in sorted(playing - on_device - {None, ""}):
         print("! The screen is set to play %s, which is no longer on the device (black screen).\n"
@@ -141,7 +153,10 @@ def cmd_upload(args):
         w //= 2
     print("Converting %s to %dx%d (%s)..." % (args.file, w, h, args.fit))
     name, data = media.convert(args.file, w, h, mode=args.fit, max_seconds=args.seconds, quality=args.quality)
-    print("  %s, %.1f MB, %d frames" % (name, len(data) / 1e6, media.count_frames(data)))
+    frames = media.read_header(data).get("frame_count", 0)
+    print("  %s, %.1f MB, %d frames" % (name, len(data) / 1e6, frames))
+    if args.seconds and frames >= args.seconds * media.FPS:
+        print("  (cut to the first %g s; use --seconds N for more, or --seconds 0 for no limit)" % args.seconds)
     with open_device(args) as dev:
         dev.upload(name, data, progress=progress_bar)
         print("Uploaded as %s" % name)
@@ -197,15 +212,21 @@ def cmd_rm(args):
         print("Removed %s" % name)
 
 
+def unused_path(folder, stem, ext):
+    """folder/stem.ext, or folder/stem (2).ext etc. if that exists: never overwrite."""
+    out = os.path.join(folder, stem + ext)
+    n = 2
+    while os.path.exists(out):
+        out = os.path.join(folder, "%s (%d)%s" % (stem, n, ext))
+        n += 1
+    return out
+
+
 def save_to_library(dev, name, folder, progress=None):
     """Pull a file from the screen and save it into the library as a playable .mp4."""
     stem = name.split(".h264_")[0]
     stem = os.path.splitext(stem)[0] if stem.lower().endswith((".mp4", ".gif", ".png", ".jpg", ".jpeg")) else stem
-    out = os.path.join(folder, stem + ".mp4")
-    n = 2
-    while os.path.exists(out):
-        out = os.path.join(folder, "%s (%d).mp4" % (stem, n))
-        n += 1
+    out = unused_path(folder, library.safe_name(stem), ".mp4")
     return media.extract_mp4(dev.pull(name, progress=progress), out)
 
 
@@ -225,9 +246,14 @@ def cmd_pull(args):
             raise DeviceError("-o only works with a single file")
         for name in names:
             data = dev.pull(name, progress=progress_bar if len(names) == 1 else None)
-            out = args.output or name
+            if args.output:      # the user's own choice of name: may overwrite
+                out = args.output
+                if args.video and not out.endswith(".mp4"):
+                    out += ".mp4"
+            else:                # a name supplied by the device: sanitized, never overwrites
+                out = unused_path(".", library.safe_name(name), ".mp4" if args.video else "")
             if args.video:
-                out = media.extract_mp4(data, out if out.endswith(".mp4") else out + ".mp4")
+                out = media.extract_mp4(data, out)
             else:
                 with open(out, "wb") as f:
                     f.write(data)
@@ -296,10 +322,6 @@ def cmd_labels(args):
         print("Labels cleared.")
 
 
-STATE_FILE = os.path.join(os.environ.get("XDG_CACHE_HOME", os.path.expanduser("~/.cache")), "frostframe",
-                          "state.json")
-
-
 def set_playback(mode, playlist=None):
     """mode: manual (you pick files), playlist, or rules. The monitor service follows this."""
     cfg = load_config()
@@ -316,7 +338,6 @@ def service_running():
 
 
 def cmd_monitor(args):
-    from . import player
     from .sensors import Sensors
     sensors = Sensors()
     stop = []
@@ -342,9 +363,14 @@ def cmd_monitor(args):
                 cfg_mtime, cfg, sent_layout = m, load_config(), False
             layout = cfg.get("layout", {})
             mode = cfg.get("playback", {}).get("mode", "manual")
-            readings = sensors.read()
             state = {"mode": mode}
-            if layout.get("metrics") or mode != "manual":
+            if not (layout.get("metrics") or mode != "manual"):
+                sensors.close()            # nothing to show or decide: no GPU polling either
+                readings = {}
+                engine.tick(cfg, readings, set())
+                last_sent = None
+            else:
+                readings = sensors.read()
                 try:
                     with Device(args.device, timeout=3) as dev:
                         dev_holder["dev"] = dev
@@ -358,7 +384,7 @@ def cmd_monitor(args):
                                     last_sent = dev.user_config().get("work", {}).get("single_file")
                             want = engine.tick(cfg, readings, set(sizes))
                             state = dict(engine.state)
-                            if want and want != last_sent:
+                            if want and want != last_sent and want in sizes:
                                 play(dev, want)
                                 last_sent = want
                                 if args.verbose:
@@ -372,11 +398,11 @@ def cmd_monitor(args):
                                 dev.set_run_config(L.build_run_config(layout, *size))
                                 sent_layout = True
                             dev.update_labels(L.values_update(layout, readings))
-                except DeviceError as e:
+                except Exception as e:     # keep running: device unplugged, busy, odd reply, ...
                     sent_layout = False  # re-send the layout once the device is back
-                    state["error"] = str(e)
-                    if args.verbose:
-                        print("  %s" % e, file=sys.stderr)
+                    state["error"] = str(e) if isinstance(e, DeviceError) else "%s: %s" % (type(e).__name__, e)
+                    if args.verbose or not isinstance(e, DeviceError):
+                        print("  %s" % state["error"], file=sys.stderr)
                 finally:
                     dev_holder.pop("dev", None)
             _write_state(state, readings)
@@ -390,8 +416,7 @@ def cmd_monitor(args):
 def _write_state(state, readings):
     try:
         os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
-        out = dict(state, time=time.time(), readings={k: v for k, v in readings.items() if k in
-                                                      ("cpu-temp", "cpu-load", "gpu-temp", "gpu-load", "ram")})
+        out = dict(state, time=time.time(), readings=readings)
         with open(STATE_FILE + ".tmp", "w") as f:
             json.dump(out, f)
         os.replace(STATE_FILE + ".tmp", STATE_FILE)
@@ -532,11 +557,15 @@ def cmd_auto(args):
         with open_device(args) as dev:
             rules["otherwise"] = parse_target(dev, cfg, args.values[0])
     elif a == "remove":
-        del rules["conditions"][int(args.values[0]) - 1]
-    elif a == "hold":
-        rules["hold"] = max(3, float(args.values[0]))
-    elif a == "hysteresis":
-        rules["hysteresis"] = max(0, float(args.values[0]))
+        conds = rules.setdefault("conditions", [])
+        if len(args.values) != 1 or not args.values[0].isdigit() or not 1 <= int(args.values[0]) <= len(conds):
+            raise DeviceError("usage: frostframe auto remove N   (N = rule number from `frostframe auto list`, 1-%d)"
+                              % len(conds) if conds else "there are no rules to remove")
+        del conds[int(args.values[0]) - 1]
+    elif a in ("hold", "hysteresis"):
+        if len(args.values) != 1:
+            raise DeviceError("usage: frostframe auto %s NUMBER" % a)
+        rules[a] = max(3 if a == "hold" else 0, float(args.values[0]))
     save_config(cfg)
     args.action = "list"
     cmd_auto(args)
@@ -569,16 +598,29 @@ def cmd_status(args):
         print("Last error: %s" % st["error"])
 
 
+def _check_low(what, percent, minimum, force):
+    if percent < minimum and not force:
+        raise DeviceError("%s below %d%% may not cool your CPU enough. If you're sure, add --force."
+                          % (what, minimum))
+
+
 def cmd_fan(args):
     if args.mode == "fixed":
         if args.percent is None or not 0 <= args.percent <= 100:
             raise DeviceError("usage: frostframe fan fixed <0-100>")
+        _check_low("Fan speed", args.percent, FAN_MIN_SAFE, args.force)
         cfg = {"mode": "Fixed", "fixed_power": args.percent}
     else:
         curve = []
         for point in (args.curve or "30:30,50:50,70:80,85:100").split(","):
-            t, p = point.split(":")
-            curve.append({"temperature": int(t), "power": int(p)})
+            try:
+                t, p = (int(x) for x in point.split(":"))
+            except ValueError:
+                raise DeviceError("curve points are TEMP:PERCENT, e.g. 30:30,50:50,70:80,85:100")
+            if not (0 <= t <= 110 and 0 <= p <= 100):
+                raise DeviceError("curve point %s: temperature must be 0-110 °C and speed 0-100%%" % point)
+            _check_low("Fan speed", p, FAN_MIN_SAFE, args.force)
+            curve.append({"temperature": t, "power": p})
         cfg = {"mode": "Smart", "curve": curve}
     with open_device(args) as dev:
         current = dev.cooler_config()
@@ -588,6 +630,9 @@ def cmd_fan(args):
 
 
 def cmd_pump(args):
+    if not 0 <= args.percent <= 100:
+        raise DeviceError("pump speed must be 0-100")
+    _check_low("Pump speed", args.percent, PUMP_MIN_SAFE, args.force)
     with open_device(args) as dev:
         current = dev.cooler_config()
         current["pump"] = {"speed_percent": args.percent}
@@ -639,12 +684,9 @@ def cmd_doctor(args):
             with open_device(args) as dev:
                 info = dev.device_info()
                 print("✔ talking to the screen: %s firmware %s" % (info.get("product_name"), info.get("firmware_version")))
-                work = dev.user_config().get("work", {})
+                wanted = playing_files(dev.user_config().get("work", {}))
                 fl = dev.file_list()
                 on_device = {os.path.basename(f.get("path", "")) for k in ("media", "presets") for f in fl.get(k, [])}
-                mode = work.get("media_mode", "Single")
-                wanted = ([work.get("left_file"), work.get("right_file")] if mode == "Dual"
-                          else [work.get("kaleidoscope_file")] if mode == "Kaleidoscope" else [work.get("single_file")])
                 for w in wanted:
                     if w and w not in on_device:
                         print("✘ set to play %s, which isn't on the device (black screen): use `frostframe play`" % w)
@@ -676,7 +718,8 @@ def main(argv=None):
                    help="fill: crop to fill (default); fit: letterbox; stretch: distort")
     s.add_argument("--half", action="store_true", help="half-width clip for dual-screen mode")
     s.add_argument("--side", choices=["left", "right"], default="left", help="with --half --play: which side")
-    s.add_argument("--seconds", type=float, help="limit video length")
+    s.add_argument("--seconds", type=float, default=media.DEFAULT_MAX_SECONDS,
+                   help="limit video length (default %d; 0 = no limit)" % media.DEFAULT_MAX_SECONDS)
     s.add_argument("--quality", type=int, default=23, help="x264 CRF, lower = better/larger (default 23)")
     s.add_argument("--play", action="store_true", help="start playing it after upload")
     s.set_defaults(func=cmd_upload)
@@ -731,10 +774,12 @@ def main(argv=None):
     s.add_argument("mode", choices=["smart", "fixed"])
     s.add_argument("percent", type=int, nargs="?")
     s.add_argument("--curve", help="smart mode curve, e.g. 30:30,50:50,70:80,85:100 (°C:%%)")
+    s.add_argument("--force", action="store_true", help="allow speeds below %d%%" % FAN_MIN_SAFE)
     s.set_defaults(func=cmd_fan)
 
     s = sub.add_parser("pump", help="pump speed (only if the pump is connected to the cooler)")
     s.add_argument("percent", type=int)
+    s.add_argument("--force", action="store_true", help="allow speeds below %d%%" % PUMP_MIN_SAFE)
     s.set_defaults(func=cmd_pump)
 
     s = sub.add_parser("playlist", help="playlists of clips (played by the background service)")
@@ -758,7 +803,7 @@ def main(argv=None):
     args = p.parse_args(argv)
     try:
         return args.func(args) or 0
-    except (DeviceError, media.MediaError, ValueError) as e:
+    except (DeviceError, media.MediaError, ValueError, OSError) as e:
         print("frostframe: %s" % e, file=sys.stderr)
         return 1
 

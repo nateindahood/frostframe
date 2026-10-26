@@ -49,6 +49,8 @@ class Worker:
                     result, error = fn(), None
                 except (DeviceError, media.MediaError, ValueError, OSError) as e:
                     result, error = None, str(e)
+                except Exception as e:      # a bug: still report it and stop the spinner
+                    result, error = None, "Unexpected error: %s: %s" % (type(e).__name__, e)
             GLib.idle_add(self._finish, done, result, error)
 
         threading.Thread(target=target, daemon=True).start()
@@ -99,8 +101,7 @@ def _heading(title):
 
 
 def _section(title):
-    lab = Gtk.Label(xalign=0)
-    lab.set_markup("<b>%s</b>" % GLib.markup_escape_text(title))
+    lab = _heading(title)
     lab.set_margin_top(12)
     return lab
 
@@ -110,6 +111,8 @@ class Window(Gtk.ApplicationWindow):
         super().__init__(application=app, title="frostframe")
         self.set_default_size(1180, 720)
         self.worker = Worker(self)
+        self._preview_lock = threading.Lock()     # one preview conversion at a time
+        self._sensors = None
         self.files = {"media": [], "presets": []}
         self.work = {}
         self.screen = (2240, 1080)
@@ -160,7 +163,8 @@ class Window(Gtk.ApplicationWindow):
         self.refresh()
         GLib.timeout_add_seconds(2, self._tick_readings)
         GLib.timeout_add_seconds(2, self._tick_now_playing)
-        self._sensors = None
+        self.connect("destroy", lambda *_: self._sensors and self._sensors.close())
+        threading.Thread(target=library.prune_cache, daemon=True).start()
 
     # ------------------------------------------------------------ helpers --
 
@@ -372,7 +376,7 @@ class Window(Gtk.ApplicationWindow):
             except GLib.Error:
                 continue
             if os.path.isdir(path):
-                paths += [os.path.join(path, n) for n in sorted(os.listdir(path)) if library.is_media(n)]
+                paths += library.list_files(path)
             else:
                 paths.append(path)
         if paths:
@@ -449,10 +453,15 @@ class Window(Gtk.ApplicationWindow):
             return library.preview_for_device_file(name, size, fetch)
 
         def target():
-            try:
-                path, err = job(), None
-            except (DeviceError, media.MediaError, OSError) as e:
-                path, err = None, str(e)
+            with self._preview_lock:
+                if gen != self._preview_gen:     # the user has already moved on
+                    return
+                try:
+                    path, err = job(), None
+                except (DeviceError, media.MediaError, OSError) as e:
+                    path, err = None, str(e)
+                except Exception as e:
+                    path, err = None, "%s: %s" % (type(e).__name__, e)
             GLib.idle_add(self._preview_ready, gen, title, path, err)
 
         threading.Thread(target=target, daemon=True).start()
@@ -477,16 +486,10 @@ class Window(Gtk.ApplicationWindow):
 
     # ----- files on the screen
 
-    def _playing(self):
-        mode = self.work.get("media_mode", "Single")
-        if mode == "Dual":
-            return {self.work.get("left_file"): "left", self.work.get("right_file"): "right"}
-        return {self.work.get("single_file"): "playing"}
-
     def _fill_files(self):
         for child in self.file_list.get_children():
             self.file_list.remove(child)
-        playing = self._playing()
+        playing = cli.playing_files(self.work)
         on_device = set()
         for kind, title in (("media", "Uploaded"), ("presets", "Built-in clips")):
             head = Gtk.Label(xalign=0, margin=4)
@@ -810,7 +813,7 @@ class Window(Gtk.ApplicationWindow):
 
     @staticmethod
     def _service_active():
-        return subprocess.run(["systemctl", "--user", "is-active", "--quiet", SERVICE]).returncode == 0
+        return cli.service_running()
 
     def _service_toggled(self, sw, _p):
         on = sw.get_active()
@@ -824,18 +827,31 @@ class Window(Gtk.ApplicationWindow):
             sw.set_active(not on)
 
     def _tick_readings(self):
-        """Show the current values next to each reading picker (no device access)."""
-        if self._sensors is None:
-            from .sensors import Sensors
-            self._sensors = Sensors()
-        r = self._sensors.read()
+        """Show the current values next to each reading picker (no device access).
+
+        Uses the background service's readings when it's running; otherwise reads the sensors
+        itself, and only while the Display tab is on screen."""
+        if not (self.get_mapped() and self.stack.get_visible_child_name() == "display"):
+            if self._sensors:
+                self._sensors.close()       # stops nvidia-smi until needed again
+            return True
+        st = cli.read_state()
+        if st and st.get("readings"):
+            r = st["readings"]
+            if self._sensors:
+                self._sensors.close()
+        else:
+            if self._sensors is None:
+                from .sensors import Sensors
+                self._sensors = Sensors()
+            r = self._sensors.read()
         self._last_readings = r
         self.screen_preview.queue_draw()
         for combo, lab in zip(self.metric_combos, self.metric_values):
             m = combo.get_active_id()
             if m and m in L.METRICS:
                 v = r.get(m)
-                title, unit, fmt = L.METRICS[m]
+                _title, unit, fmt = L.METRICS[m]
                 lab.set_text("--" if v is None else (fmt.format(v) + " " + unit).strip())
             else:
                 lab.set_text("")
@@ -1000,7 +1016,7 @@ class Window(Gtk.ApplicationWindow):
         if not self._service_active():
             r = subprocess.run(["systemctl", "--user", "enable", "--now", SERVICE], capture_output=True, text=True)
             if r.returncode != 0:
-                self.show_error("Playlists and automation need the background service: %s\\n"
+                self.show_error("Playlists and automation need the background service: %s\n"
                                 "Install it with ./install.sh --service." % r.stderr.strip())
                 return
             self.service_switch.set_active(True)
@@ -1051,7 +1067,7 @@ class Window(Gtk.ApplicationWindow):
             box = Gtk.Box(spacing=6, margin=3)
             lab = Gtk.Label(label=it["file"].split(".h264_")[0], xalign=0, ellipsize=3)
             lab.set_tooltip_text(it["file"] + ("" if it["file"] in on_screen or not on_screen
-                                               else "\\n(not on the screen any more: skipped)"))
+                                               else "\n(not on the screen any more: skipped)"))
             if on_screen and it["file"] not in on_screen:
                 lab.get_style_context().add_class("dim-label")
             box.pack_start(lab, True, True, 0)
@@ -1328,6 +1344,18 @@ class Window(Gtk.ApplicationWindow):
             fan = {"mode": "Smart", "curve": [{"temperature": t, "power": p}
                                               for t, p in ((30, 30), (50, 50), (70, 80), (85, 100))]}
         pump = {"speed_percent": int(self.pump.get_value())}
+        low = [what for what, v, lim in (("pump", pump["speed_percent"], cli.PUMP_MIN_SAFE),
+                                         ("fan", fan.get("fixed_power", 100), cli.FAN_MIN_SAFE)) if v < lim]
+        if low:
+            dlg = Gtk.MessageDialog(transient_for=self, modal=True, message_type=Gtk.MessageType.WARNING,
+                                    buttons=Gtk.ButtonsType.OK_CANCEL,
+                                    text="Set the %s this low?" % " and ".join(low))
+            dlg.format_secondary_text("Below %d%% pump or %d%% fan speed, the cooler may not keep your CPU "
+                                      "cool enough." % (cli.PUMP_MIN_SAFE, cli.FAN_MIN_SAFE))
+            resp = dlg.run()
+            dlg.destroy()
+            if resp != Gtk.ResponseType.OK:
+                return
 
         def op(d):
             cfg = d.cooler_config()

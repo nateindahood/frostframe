@@ -92,19 +92,36 @@ def mem_used_percent():
 
 
 class Nvidia:
-    """Keeps one `nvidia-smi -lms` process running and remembers its latest reading."""
+    """Keeps one `nvidia-smi -lms` process running and remembers its latest reading.
+
+    Readings older than STALE seconds are dropped (rather than shown frozen), and the process
+    is restarted if it exits, e.g. after a driver update."""
 
     FIELDS = "temperature.gpu,utilization.gpu,clocks.gr,power.draw"
+    STALE = 5.0
+    RESTART_SECONDS = 30.0
 
     def __init__(self, interval_ms=1000):
+        self.interval_ms = interval_ms
         self.latest = None
-        self.proc = subprocess.Popen(
-            ["nvidia-smi", "--query-gpu=" + self.FIELDS, "--format=csv,noheader,nounits",
-             "-lms", str(interval_ms)], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
-        threading.Thread(target=self._reader, daemon=True).start()
+        self.at = 0.0
+        self.proc = None
+        self.started = 0.0
+        self._start()
 
-    def _reader(self):
-        for line in self.proc.stdout:
+    def _start(self):
+        self.started = time.monotonic()
+        try:
+            self.proc = subprocess.Popen(
+                ["nvidia-smi", "--query-gpu=" + self.FIELDS, "--format=csv,noheader,nounits",
+                 "-lms", str(self.interval_ms)], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+        except OSError:
+            self.proc = None
+            return
+        threading.Thread(target=self._reader, args=(self.proc,), daemon=True).start()
+
+    def _reader(self, proc):
+        for line in proc.stdout:
             vals = []
             for x in line.split(",")[:4]:
                 try:
@@ -113,12 +130,23 @@ class Nvidia:
                     vals.append(None)
             if len(vals) == 4:
                 self.latest = dict(zip(("temp", "load", "clock", "power"), vals))
+                self.at = time.monotonic()
 
     def get(self):
-        return self.latest or {}
+        now = time.monotonic()
+        if (self.proc is None or self.proc.poll() is not None) and now - self.started > self.RESTART_SECONDS:
+            self.close()
+            self._start()
+        return self.latest if self.latest and now - self.at < self.STALE else {}
 
     def close(self):
-        self.proc.terminate()
+        if self.proc and self.proc.poll() is None:
+            self.proc.terminate()
+            try:
+                self.proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
+        self.proc = None
 
 
 def amdgpu():
@@ -148,9 +176,11 @@ class Sensors:
     def __init__(self):
         self._cpu = _Rate(_cpu_times)
         self._net = _Rate(_net_bytes)
-        self._nv = Nvidia() if shutil.which("nvidia-smi") else None
+        self._nv = None           # started on first use
 
     def read(self):
+        if self._nv is None and shutil.which("nvidia-smi"):
+            self._nv = Nvidia()
         (idle, total), (pidle, ptotal) = self._cpu.get()
         load = 100.0 * (1 - (idle - pidle) / (total - ptotal)) if total > ptotal else None
         (rx, tx, t), (prx, ptx, pt) = self._net.get()
@@ -168,5 +198,7 @@ class Sensors:
         }
 
     def close(self):
+        """Stop the GPU reader (read() starts it again if needed)."""
         if self._nv:
             self._nv.close()
+            self._nv = None

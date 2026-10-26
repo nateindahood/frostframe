@@ -1,9 +1,11 @@
 """The local media library (a folder of GIFs/videos/images) and preview generation."""
 
+import functools
 import hashlib
 import os
 import shutil
 import subprocess
+import tempfile
 
 from . import media
 
@@ -12,8 +14,10 @@ STILLS = (".png", ".jpg", ".jpeg")
 CACHE_DIR = os.path.join(os.environ.get("XDG_CACHE_HOME", os.path.expanduser("~/.cache")), "frostframe", "previews")
 PREVIEW_WIDTH = 360
 PREVIEW_SECONDS = 8
+CACHE_LIMIT = 100 * 1024 * 1024    # previews beyond this are pruned, oldest first
 
 
+@functools.lru_cache(maxsize=None)
 def default_dir():
     pictures = None
     try:
@@ -66,12 +70,42 @@ def _gif_preview(cmd_input, out, data=None, h264=False):
     cmd = [media.ffmpeg_path(), "-hide_banner", "-loglevel", "error", "-y"]
     if h264:
         cmd += ["-f", "h264", "-r", "30"]
-    cmd += ["-i", cmd_input, "-t", str(PREVIEW_SECONDS), "-vf", vf, "-loop", "0", out + ".tmp.gif"]
-    r = subprocess.run(cmd, input=data, capture_output=True)
-    if r.returncode != 0 or not os.path.exists(out + ".tmp.gif"):
-        raise media.MediaError("couldn't make a preview: %s" % r.stderr.decode(errors="replace").strip()[-300:])
-    os.replace(out + ".tmp.gif", out)
+    fd, tmp = tempfile.mkstemp(suffix=".gif", dir=os.path.dirname(out))
+    os.close(fd)
+    try:
+        cmd += ["-i", cmd_input, "-t", str(PREVIEW_SECONDS), "-vf", vf, "-loop", "0", tmp]
+        r = subprocess.run(cmd, input=data, capture_output=True)
+        if r.returncode != 0 or not os.path.getsize(tmp):
+            raise media.MediaError("couldn't make a preview: %s" % r.stderr.decode(errors="replace").strip()[-300:])
+        os.replace(tmp, out)
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
     return out
+
+
+def prune_cache(limit=CACHE_LIMIT):
+    """Delete the least recently used previews until the cache is under `limit` bytes."""
+    try:
+        entries = [os.path.join(CACHE_DIR, n) for n in os.listdir(CACHE_DIR)]
+    except OSError:
+        return
+    stats = []
+    for p in entries:
+        try:
+            st = os.stat(p)
+        except OSError:
+            continue
+        stats.append((max(st.st_atime, st.st_mtime), st.st_size, p))
+    total = sum(size for _t, size, _p in stats)
+    for _t, size, p in sorted(stats):
+        if total <= limit:
+            break
+        try:
+            os.unlink(p)
+            total -= size
+        except OSError:
+            pass
 
 
 def preview_for_file(path):
@@ -82,20 +116,28 @@ def preview_for_file(path):
     key = hashlib.sha1(("%s|%d|%d" % (os.path.abspath(path), st.st_size, int(st.st_mtime))).encode()).hexdigest()[:16]
     out = os.path.join(CACHE_DIR, "local-%s.gif" % key)
     if os.path.exists(out):
+        os.utime(out)     # mark as recently used for prune_cache()
         return out
     os.makedirs(CACHE_DIR, exist_ok=True)
     return _gif_preview(path, out)
 
 
+def safe_name(name):
+    """A device-supplied file name made safe to use as a local file name: no path separators,
+    no hidden files, nothing that looks like a command-line option."""
+    safe = "".join(c if c.isalnum() or c in "._-" else "_" for c in name).lstrip(".-")
+    return safe or "file"
+
+
 def device_preview_path(name, size):
-    safe = "".join(c if c.isalnum() or c in "._-" else "_" for c in name)
-    return os.path.join(CACHE_DIR, "screen-%s-%d.gif" % (safe, size))
+    return os.path.join(CACHE_DIR, "screen-%s-%d.gif" % (safe_name(name), size))
 
 
 def preview_for_device_file(name, size, fetch):
     """fetch() returns the file's bytes from the screen; result cached by name and size."""
     out = device_preview_path(name, size)
     if os.path.exists(out):
+        os.utime(out)
         return out
     os.makedirs(CACHE_DIR, exist_ok=True)
     return _gif_preview("pipe:0", out, data=fetch(), h264=True)
