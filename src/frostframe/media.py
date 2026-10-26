@@ -109,6 +109,15 @@ def count_frames(stream):
     return n
 
 
+def extract_mp4(device_file, out):
+    """Turn a device media file (header + raw H.264) into a playable .mp4 (no re-encode)."""
+    r = subprocess.run([ffmpeg_path(), "-hide_banner", "-loglevel", "error", "-y", "-f", "h264", "-r", str(FPS),
+                        "-i", "pipe:0", "-c", "copy", out], input=device_file, capture_output=True)
+    if r.returncode != 0:
+        raise MediaError("ffmpeg failed: %s" % r.stderr.decode(errors="replace").strip()[-300:])
+    return out
+
+
 def read_header(data):
     """Parse the media header of a device file (for `frostframe inspect`)."""
     n = struct.unpack("<I", data[:4])[0]

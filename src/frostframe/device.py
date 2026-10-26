@@ -43,6 +43,16 @@ def crc32c(data):
     return crc ^ 0xFFFFFFFF
 
 
+def descramble(data, start=0):
+    """Undo the device's read obfuscation: byte i is XOR-ed with ((start + i) & 0xFF)."""
+    if not data:
+        return data
+    key = bytes((start + i) & 0xFF for i in range(256))
+    key = (key * (len(data) // 256 + 2))[: len(data)]
+    n = len(data)
+    return (int.from_bytes(data, "big") ^ int.from_bytes(key, "big")).to_bytes(n, "big")
+
+
 _TABLE = None
 
 
@@ -230,6 +240,31 @@ class Device:
         body = {"groups": [{"id": g, "labels": [{"id": l, "text": t} for l, t in labels.items()]}
                            for g, labels in groups.items()]}
         self.request("label_update", body)
+
+    def pull(self, name, progress=None, limit=None):
+        """Download a file from the screen (returns the original bytes; at most `limit` bytes).
+
+        The device sends file contents XOR-ed with the byte position (i & 0xFF); undone here."""
+        session = (self._track + 1) & 0xFFFFFFFF
+        buf = bytearray()
+        size = None
+        while size is None or len(buf) < size:
+            kind, body = self.request("file_pull", {"name": name.encode(), "session_id": session,
+                                                    "offset": len(buf)}, timeout=15)
+            if kind != "file_pull_result" or body.get("status", "OK") not in ("OK", 0):
+                raise DeviceError("could not read %s from the screen" % name)
+            size = body.get("file_size", 0)
+            chunk = body.get("data", b"")
+            if not chunk:
+                break
+            buf += chunk
+            if progress:
+                progress(len(buf), size)
+            if limit and len(buf) >= limit:
+                return descramble(bytes(buf))
+        if len(buf) != size:
+            raise DeviceError("incomplete read of %s (%d of %d bytes)" % (name, len(buf), size or 0))
+        return descramble(bytes(buf))
 
     def remove_file(self, name, file_type="media"):
         self.request("file_remove", {"name": name, "file_type": file_type})

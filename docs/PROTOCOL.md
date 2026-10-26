@@ -51,7 +51,15 @@ implementation of these messages is in `src/frostframe/protocol.py`.
 | 420 | host_ctl_set_volume | `{volume}` | vendor sends it; this device answers BodyCaseNotSupported |
 | 450 | sys_ctl_exec | `{cmd: "Reboot" / "InstallApp", params}` | **don't use**: on firmware v2.0.6, `Reboot` restarts the screen into Rockchip loader mode (USB `2207:350a`) and it stays there until a full power cycle (PSU off) |
 
-(Fields 404–406 are for the vendor's encrypted store content and pulling files; 451, 900, 999 are
+| 406 | file_pull | `{file_name: bytes, session_id, file_offset}` | → `file_pull_response` (805) `{status, file_name, session_id, file_offset, file_size, file_data}`, 64 KiB per reply |
+| 109 / 203 | get/set media thumbnail | | not supported by firmware v2.0.6 (BodyCaseNotSupported) |
+
+**Pulled data is obfuscated:** byte *i* of the file (counting from the start of the file) comes back
+XOR-ed with `i & 0xFF`. Undoing that gives back the exact file that was uploaded (verified
+byte-for-byte). Built-in clips use a slightly different header, but the H.264 stream after it is
+the same format. A full 3.8 MB clip pulls in about 0.7 s.
+
+(Fields 404–405 are for the vendor's encrypted store content; 451, 900, 999 are
 serial-number/factory/debug functions. Out of scope.)
 
 ## Handshake seen from the vendor app
@@ -111,7 +119,8 @@ Media files are referenced by bare file name (e.g. `default_04.mp4.h264_2240x108
 (Left/...), line_gap, labels[] {label_id, line, gap_left, text_font, text_size, text_color (0xRRGGBB
 as integer; vendor "white" = 0xDCDCDC), text}`, optional background/gradient colors.
 Live values are pushed with `batch_group_label_update { label_groups { group_id label_texts {label_id text} } }`.
-Fonts seen: `roboto-regular`, `RubikGlitch-Regular` (built into the device).
+Fonts built into the device (the vendor app offers exactly these): `roboto-regular`,
+`BitcountSingle-Regular`, `Orbitron-Regular`, `RubikGlitch-Regular`.
 
 ## Cooler (fan/pump)
 

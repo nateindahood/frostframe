@@ -10,6 +10,7 @@ import time
 
 from . import __version__
 from . import labels as L
+from . import library
 from . import media
 from .device import Device, DeviceError, find_devices
 
@@ -129,6 +130,10 @@ def cmd_files(args):
 
 
 def cmd_upload(args):
+    if not os.path.exists(args.file):
+        candidate = os.path.join(library.library_dir(load_config()), args.file)
+        if os.path.exists(candidate):
+            args.file = candidate
     with open_device(args) as dev:
         w, h = dev.screen_size()
     if args.half:
@@ -187,6 +192,37 @@ def cmd_rm(args):
             raise DeviceError("%s is a built-in preset and can't be removed" % name)
         dev.remove_file(name)
         print("Removed %s" % name)
+
+
+def cmd_pull(args):
+    with open_device(args) as dev:
+        name = resolve_file(dev, args.name)
+        data = dev.pull(name, progress=progress_bar)
+    out = args.output or name
+    if args.video:
+        r = media.extract_mp4(data, out if out.endswith(".mp4") else out + ".mp4")
+        print("Saved %s" % r)
+    else:
+        with open(out, "wb") as f:
+            f.write(data)
+        print("Saved %s (%.1f MB)" % (out, len(data) / 1e6))
+
+
+def cmd_library(args):
+    folder = library.library_dir(load_config())
+    if args.action == "path":
+        print(folder)
+        return
+    if args.action == "add":
+        if not args.files:
+            raise DeviceError("usage: frostframe library add FILE...")
+        for f in args.files:
+            print("Added %s" % library.add(folder, f))
+        return
+    files = library.list_files(folder)
+    print("Library: %s (%d files)" % (folder, len(files)))
+    for f in files:
+        print("  %-60s %7.1f MB" % (os.path.basename(f), os.path.getsize(f) / 1e6))
 
 
 def cmd_brightness(args):
@@ -374,7 +410,7 @@ def main(argv=None):
     sub.add_parser("files", help="list media on the screen").set_defaults(func=cmd_files)
 
     s = sub.add_parser("upload", help="convert and upload an image, GIF or video")
-    s.add_argument("file")
+    s.add_argument("file", help="a path, or a file name from your library")
     s.add_argument("--fit", choices=["fill", "fit", "stretch"], default="fill",
                    help="fill: crop to fill (default); fit: letterbox; stretch: distort")
     s.add_argument("--half", action="store_true", help="half-width clip for dual-screen mode")
@@ -390,6 +426,17 @@ def main(argv=None):
     s.add_argument("--right", help="dual-screen mode: right file")
     s.add_argument("--loop", choices=["single", "all", "random", "presets", "random-presets"], default="single")
     s.set_defaults(func=cmd_play)
+
+    s = sub.add_parser("pull", help="download a file from the screen")
+    s.add_argument("name")
+    s.add_argument("-o", "--output", help="output file (default: the device file name)")
+    s.add_argument("--video", action="store_true", help="save as a playable .mp4 instead of the raw device file")
+    s.set_defaults(func=cmd_pull)
+
+    s = sub.add_parser("library", help="your local media folder (default ~/Pictures/frostframe)")
+    s.add_argument("action", nargs="?", choices=["list", "add", "path"], default="list")
+    s.add_argument("files", nargs="*")
+    s.set_defaults(func=cmd_library)
 
     s = sub.add_parser("rm", help="delete one of your files from the screen")
     s.add_argument("name")

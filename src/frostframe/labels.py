@@ -16,7 +16,14 @@ METRICS = {
     "date": ("DATE", "", "{}"),
 }
 
-FONTS = ["roboto-regular", "RubikGlitch-Regular"]  # fonts the device firmware is known to have
+# Fonts built into the screen firmware (the device renders the text itself): id -> display name
+FONT_NAMES = {
+    "roboto-regular": "Roboto",
+    "BitcountSingle-Regular": "Bitcount Single",
+    "Orbitron-Regular": "Orbitron",
+    "RubikGlitch-Regular": "Rubik Glitch",
+}
+FONTS = list(FONT_NAMES)
 NAMED_COLORS = {"white": 0xFFFFFF, "black": 0x000000, "grey": 0xDCDCDC, "gray": 0xDCDCDC,
                 "red": 0xFF3B30, "orange": 0xFF9500, "yellow": 0xFFCC00, "green": 0x34C759,
                 "cyan": 0x32D7FF, "blue": 0x0A84FF, "purple": 0xBF5AF2, "pink": 0xFF2D92}

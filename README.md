@@ -17,8 +17,16 @@ $ frostframe monitor        # or: ./install.sh --service
 ```
 
 Prefer clicking? `frostframe gui` (or **frostframe** in your app menu) opens a GTK window with
-the same features: media library with upload/play/delete, dual-screen, brightness, on-screen
-readings with any text color, the background service switch, and cooler settings.
+the same features, plus:
+
+- **Your library**: a folder of GIFs, videos and images (`~/Pictures/frostframe` by default).
+  Drag files onto the window, use *Add files…*, or copy them in with your file manager; then
+  **Send to screen** in one click.
+- **Preview**: select any file, in your library *or already on the screen* (built-in clips
+  too), to see it animate in the preview box.
+- Media on the screen with play / dual-screen left & right / delete, brightness, on-screen
+  readings with any text color and all four built-in fonts, the background-service switch,
+  and cooler settings.
 
 > **Unofficial, independent project.** frostframe is not affiliated with, endorsed by or
 > supported by the cooler's manufacturer. Product and company names mentioned here belong to
@@ -74,7 +82,9 @@ you still need the udev rule from `packaging/`.
 | `frostframe gui [--page media\|display\|cooler]` | Graphical interface |
 | `frostframe info` | Model, firmware, serial, screen size |
 | `frostframe files` | Media on the screen (▶ = playing) |
-| `frostframe upload FILE [--play]` | Convert (ffmpeg) and upload a GIF, MP4, PNG or JPEG |
+| `frostframe upload FILE [--play]` | Convert (ffmpeg) and upload a GIF, MP4, PNG or JPEG (path or library file name) |
+| `frostframe library [add FILE... \| path]` | Your local media folder |
+| `frostframe pull NAME [--video]` | Download a file from the screen (`--video`: as a playable .mp4) |
 | `frostframe upload FILE --half --play --side right` | Half-width clip for dual-screen mode |
 | `frostframe play NAME` | Play a file (full name or unique prefix, e.g. `default_03`) |
 | `frostframe play --left A --right B` | Dual-screen mode, two clips side by side |
@@ -91,7 +101,7 @@ you still need the udev rule from `packaging/`.
 Upload options: `--fit fill` (crop to fill, default), `--fit fit` (letterbox), `--fit stretch`,
 `--seconds N` (trim long videos), `--quality N` (x264 CRF, default 23; lower is sharper and larger).
 
-Label options: `--color white|cyan|#ff8800|...` (any RGB color), `--font roboto-regular|RubikGlitch-Regular`,
+Label options: `--color white|cyan|#ff8800|...` (any RGB color), `--font roboto-regular|BitcountSingle-Regular|Orbitron-Regular|RubikGlitch-Regular`,
 `--side left|right|full`, `--size 160`. Metrics: `cpu-temp cpu-load cpu-clock gpu-temp gpu-load
 gpu-clock gpu-power ram net-down net-up time date`.
 
@@ -127,7 +137,8 @@ documented in [docs/PROTOCOL.md](docs/PROTOCOL.md).
 | Play / switch media, dual-screen mode | ✅ tested |
 | On-screen live readings (labels + monitor) | ✅ tested |
 | Upload (GIF/MP4/PNG/JPEG → H.264) | ✅ tested |
-| GUI (GTK 3) | ✅ tested on Cinnamon |
+| GUI (GTK 3), library, previews | ✅ tested on Cinnamon |
+| Download files from the screen | ✅ tested |
 | Fan/pump settings | ⚠️ accepted by the device; effect untested (fans on motherboard on the test system) |
 | RGB light settings, live frame streaming | 🔜 in the protocol, not implemented yet |
 

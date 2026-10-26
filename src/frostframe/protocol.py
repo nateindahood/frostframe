@@ -48,6 +48,13 @@ FILE_END = {1: ("file_type", "bytes", None), 2: ("crc", "uint", None)}
 FILE_STATUS_CODES = {"OK": 0, "SpaceNotEnough": 1, "FileError": 2, "CRCFail": 3}
 FILE_STATUS = {1: ("status", "enum", FILE_STATUS_CODES)}
 FILE_REMOVE = {1: ("name", "string", None), 2: ("file_type", "string", None)}
+THUMB_GET = {1: ("name", "string", None)}
+PULL_REQ = {1: ("name", "bytes", None), 2: ("session_id", "uint", None), 3: ("offset", "uint", None)}
+PULL_STATUS = {"OK": 0, "FileError": 1}
+PULL_RSP = {1: ("status", "enum", PULL_STATUS), 2: ("name", "bytes", None), 3: ("session_id", "uint", None),
+            4: ("offset", "uint", None), 5: ("file_size", "uint", None), 6: ("data", "bytes", None)}
+THUMB_SET = {1: ("name", "string", None), 2: ("data", "bytes", None)}
+THUMB = {1: ("name", "string", None), 2: ("has_thumbnail", "bool", None), 3: ("data", "bytes", None)}
 
 # Header prepended to uploaded media files (uint32 LE length + this message + payload)
 ORIGINAL_TYPES = {"Unknown": 0, "JPEG": 1, "PNG": 2, "GIF": 3, "MP4": 4}
@@ -149,10 +156,12 @@ REQUESTS = {
     "get_run_config": (105, DUMMY),
     "get_cooler_config": (106, DUMMY),
     "get_cooler_status": (107, DUMMY),
+    "get_thumbnail": (109, THUMB_GET),
     "get_storage_status": (110, DUMMY),
     "user_config": (200, USER_CONFIG),
     "run_config": (201, RUN_CONFIG),
     "cooler_config": (202, COOLER_CONFIG),
+    "set_thumbnail": (203, THUMB_SET),
     "label_update": (300, LABEL_UPDATE),
     "label_group_create": (301, LABEL_GROUP),
     "label_group_destroy": (302, LABEL_GROUP),
@@ -160,6 +169,7 @@ REQUESTS = {
     "file_data": (401, FILE_DATA),
     "file_end": (402, FILE_END),
     "file_remove": (403, FILE_REMOVE),
+    "file_pull": (406, PULL_REQ),
     "sys_exec": (450, SYS_EXEC),
 }
 
@@ -173,12 +183,14 @@ RESPONSES = {
     505: ("run_config", RUN_CONFIG),
     506: ("cooler_config", COOLER_CONFIG),
     507: ("cooler_status", COOLER_STATUS),
+    509: ("thumbnail", THUMB),
     510: ("storage_status", STORAGE_STATUS),
     600: ("ok", DUMMY),
     800: ("file_begin_status", FILE_STATUS),
     801: ("file_data_status", FILE_STATUS),
     802: ("file_end_status", FILE_STATUS),
     850: ("sys_exec_result", {1: ("status", "uint", None), 2: ("message", "string", None)}),
+    805: ("file_pull_result", PULL_RSP),
     822: ("app_exception", {1: ("type", "uint", None), 2: ("error_code", "sint", None),
                             3: ("source", "string", None), 4: ("message", "string", None)}),
 }

@@ -7,15 +7,20 @@ import threading
 import gi
 
 gi.require_version("Gtk", "3.0")
-from gi.repository import GLib, Gtk  # noqa: E402
+gi.require_version("Gdk", "3.0")
+gi.require_version("GdkPixbuf", "2.0")
+from gi.repository import Gdk, GdkPixbuf, Gio, GLib, Gtk  # noqa: E402
 
 from . import __version__  # noqa: E402
 from . import cli  # noqa: E402
 from . import labels as L  # noqa: E402
+from . import library  # noqa: E402
 from . import media  # noqa: E402
 from .device import Device, DeviceError, find_devices  # noqa: E402
 
 SERVICE = "frostframe-monitor.service"
+PREVIEW_W, PREVIEW_H = 380, 240
+PREVIEW_PULL_BYTES = 4 * 1024 * 1024   # the first few seconds of a clip are enough for a preview
 METRIC_NAMES = {"": "(none)", "cpu-temp": "CPU temperature", "cpu-load": "CPU usage",
                 "cpu-clock": "CPU clock", "gpu-temp": "GPU temperature", "gpu-load": "GPU usage",
                 "gpu-clock": "GPU clock", "gpu-power": "GPU power", "ram": "RAM usage",
@@ -74,6 +79,12 @@ def _row(label_text, widget, hint=None):
     return box
 
 
+def _heading(title):
+    lab = Gtk.Label(xalign=0)
+    lab.set_markup("<b>%s</b>" % GLib.markup_escape_text(title))
+    return lab
+
+
 def _section(title):
     lab = Gtk.Label(xalign=0)
     lab.set_markup("<b>%s</b>" % GLib.markup_escape_text(title))
@@ -84,7 +95,7 @@ def _section(title):
 class Window(Gtk.ApplicationWindow):
     def __init__(self, app, page=None):
         super().__init__(application=app, title="frostframe")
-        self.set_default_size(900, 640)
+        self.set_default_size(1180, 720)
         self.worker = Worker(self)
         self.files = {"media": [], "presets": []}
         self.work = {}
@@ -122,9 +133,14 @@ class Window(Gtk.ApplicationWindow):
         self.status.get_style_context().add_class("dim-label")
         outer.pack_end(self.status, False, False, 0)
 
+        self.drag_dest_set(Gtk.DestDefaults.ALL, [], Gdk.DragAction.COPY)
+        self.drag_dest_add_uri_targets()
+        self.connect("drag-data-received", self._on_drop)
+
         self.show_all()
         self.infobar.hide()
         self.progress.hide()
+        self._watch_library()
         if page:
             stack.set_visible_child_name(page)
         self.refresh()
@@ -191,11 +207,15 @@ class Window(Gtk.ApplicationWindow):
     # --------------------------------------------------------------- media --
 
     def _media_page(self):
-        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8, margin=12)
-        self.file_list = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE)
-        scroll = Gtk.ScrolledWindow(vexpand=True)
-        scroll.add(self.file_list)
-        box.pack_start(scroll, True, True, 0)
+        paned = Gtk.Paned(orientation=Gtk.Orientation.HORIZONTAL, margin=12)
+        left = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+
+        left.pack_start(_heading("On your screen"), False, False, 0)
+        self.file_list = Gtk.ListBox(selection_mode=Gtk.SelectionMode.SINGLE)
+        self.file_list.connect("row-selected", self._screen_row_selected)
+        sc = Gtk.ScrolledWindow(vexpand=True)
+        sc.add(self.file_list)
+        left.pack_start(sc, True, True, 0)
 
         bar = Gtk.Box(spacing=8)
         self.loop_combo = _combo([("single", "Play one file"), ("all", "Loop your files"),
@@ -203,23 +223,243 @@ class Window(Gtk.ApplicationWindow):
         self.loop_combo.connect("changed", self._loop_changed)
         bar.pack_start(Gtk.Label(label="Playback:"), False, False, 0)
         bar.pack_start(self.loop_combo, False, False, 0)
-        box.pack_start(bar, False, False, 0)
+        left.pack_start(bar, False, False, 0)
+
+        head = Gtk.Box(spacing=6)
+        self.lib_title = _heading("Your library")
+        head.pack_start(self.lib_title, True, True, 0)
+        for label, tip, cb in (("Add files…", "Copy images, GIFs or videos into your library", self._choose_add),
+                               ("Open folder", "Open the library folder in your file manager", self._open_library),
+                               ("Change folder…", "Use a different folder as your library", self._change_library)):
+            b = Gtk.Button(label=label)
+            b.set_tooltip_text(tip)
+            b.connect("clicked", cb)
+            head.pack_start(b, False, False, 0)
+        left.pack_start(head, False, False, 0)
+        self.lib_list = Gtk.ListBox(selection_mode=Gtk.SelectionMode.SINGLE)
+        self.lib_list.connect("row-selected", self._library_row_selected)
+        hint = Gtk.Label(label="Drop GIFs, videos or images anywhere on this window\n"
+                               "(or copy them into the library folder) to keep them here.", justify=Gtk.Justification.CENTER)
+        hint.get_style_context().add_class("dim-label")
+        hint.show()
+        self.lib_list.set_placeholder(hint)
+        sc2 = Gtk.ScrolledWindow(vexpand=True)
+        sc2.add(self.lib_list)
+        left.pack_start(sc2, True, True, 0)
 
         up = Gtk.Box(spacing=8)
-        btn = Gtk.Button(label="Upload image, GIF or video…")
-        btn.get_style_context().add_class("suggested-action")
-        btn.connect("clicked", self._choose_upload)
-        up.pack_start(btn, False, False, 0)
+        up.pack_start(Gtk.Label(label="Send as:"), False, False, 0)
         self.fit_combo = _combo([("fill", "Fill (crop)"), ("fit", "Fit (letterbox)"), ("stretch", "Stretch")])
         up.pack_start(self.fit_combo, False, False, 0)
         self.half_check = Gtk.CheckButton(label="Half width (dual-screen)")
         up.pack_start(self.half_check, False, False, 0)
-        self.play_check = Gtk.CheckButton(label="Play after upload", active=True)
+        self.play_check = Gtk.CheckButton(label="Play after sending", active=True)
         up.pack_start(self.play_check, False, False, 0)
-        box.pack_start(up, False, False, 0)
+        left.pack_start(up, False, False, 0)
         self.progress = Gtk.ProgressBar(show_text=True)
-        box.pack_start(self.progress, False, False, 0)
-        return box
+        left.pack_start(self.progress, False, False, 0)
+        paned.pack1(left, True, False)
+
+        right = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6, margin_start=12)
+        right.pack_start(_heading("Preview"), False, False, 0)
+        frame = Gtk.Frame()
+        self.preview_img = Gtk.Image()
+        self.preview_img.set_size_request(PREVIEW_W, PREVIEW_H)
+        frame.add(self.preview_img)
+        right.pack_start(frame, False, False, 0)
+        self.preview_spinner = Gtk.Spinner()
+        right.pack_start(self.preview_spinner, False, False, 0)
+        self.preview_caption = Gtk.Label(label="Select a file to preview it.", xalign=0, wrap=True,
+                                         max_width_chars=40)
+        self.preview_caption.get_style_context().add_class("dim-label")
+        right.pack_start(self.preview_caption, False, False, 0)
+        paned.pack2(right, False, False)
+        return paned
+
+    # ----- library
+
+    def _library_path(self):
+        return library.library_dir(cli.load_config())
+
+    def _watch_library(self):
+        folder = self._library_path()
+        if getattr(self, "_lib_monitor", None):
+            self._lib_monitor.cancel()
+        self._lib_monitor = Gio.File.new_for_path(folder).monitor_directory(Gio.FileMonitorFlags.NONE, None)
+        self._lib_monitor.connect("changed", lambda *_: self._schedule_library_refresh())
+        self.refresh_library()
+
+    def _schedule_library_refresh(self):
+        if getattr(self, "_lib_timer", None):
+            GLib.source_remove(self._lib_timer)
+        self._lib_timer = GLib.timeout_add(500, self._library_timer_fired)
+
+    def _library_timer_fired(self):
+        self._lib_timer = None
+        self.refresh_library()
+        return False
+
+    def refresh_library(self):
+        folder = self._library_path()
+        self.lib_title.set_markup("<b>Your library</b>  <small>%s</small>" % GLib.markup_escape_text(
+            folder.replace(os.path.expanduser("~"), "~", 1)))
+        for child in self.lib_list.get_children():
+            self.lib_list.remove(child)
+        for path in library.list_files(folder):
+            self.lib_list.add(self._library_row(path))
+        self.lib_list.show_all()
+
+    def _library_row(self, path):
+        row = Gtk.ListBoxRow()
+        row.path = path
+        box = Gtk.Box(spacing=8, margin=4)
+        lab = Gtk.Label(label=os.path.basename(path), xalign=0, ellipsize=3)
+        lab.set_tooltip_text(path)
+        box.pack_start(lab, True, True, 0)
+        try:
+            size = os.path.getsize(path)
+        except OSError:
+            size = 0
+        sz = Gtk.Label(label="%.1f MB" % (size / 1e6))
+        sz.get_style_context().add_class("dim-label")
+        box.pack_start(sz, False, False, 0)
+        send = Gtk.Button(label="Send to screen")
+        send.set_tooltip_text("Convert and upload to the cooler screen")
+        send.connect("clicked", lambda *_: self._upload(path))
+        box.pack_start(send, False, False, 0)
+        rm = Gtk.Button.new_from_icon_name("user-trash-symbolic", Gtk.IconSize.BUTTON)
+        rm.set_tooltip_text("Move to the trash (removes it from your library only)")
+        rm.connect("clicked", lambda *_: self._trash_library_file(path))
+        box.pack_start(rm, False, False, 0)
+        row.add(box)
+        return row
+
+    def _add_to_library(self, paths):
+        folder = self._library_path()
+        added, skipped = [], []
+        for p in paths:
+            try:
+                added.append(library.add(folder, p))
+            except (media.MediaError, OSError) as e:
+                skipped.append("%s (%s)" % (os.path.basename(p), e))
+        self.refresh_library()
+        if added:
+            self.status.set_text("Added %d file(s) to your library." % len(added))
+        if skipped:
+            self.show_error("Not added: " + "; ".join(skipped))
+
+    def _on_drop(self, _w, _ctx, _x, _y, data, _info, _time):
+        paths = []
+        for uri in data.get_uris() or []:
+            try:
+                path, _host = GLib.filename_from_uri(uri)
+            except GLib.Error:
+                continue
+            if os.path.isdir(path):
+                paths += [os.path.join(path, n) for n in sorted(os.listdir(path)) if library.is_media(n)]
+            else:
+                paths.append(path)
+        if paths:
+            self._add_to_library(paths)
+
+    def _choose_add(self, *_):
+        dlg = Gtk.FileChooserDialog(title="Add images, GIFs or videos to your library", transient_for=self,
+                                    action=Gtk.FileChooserAction.OPEN, select_multiple=True)
+        dlg.add_buttons("_Cancel", Gtk.ResponseType.CANCEL, "_Add", Gtk.ResponseType.ACCEPT)
+        flt = Gtk.FileFilter()
+        flt.set_name("Images, GIFs and videos")
+        for ext in library.EXTENSIONS:
+            flt.add_pattern("*" + ext)
+            flt.add_pattern("*" + ext.upper())
+        dlg.add_filter(flt)
+        resp = dlg.run()
+        paths = dlg.get_filenames()
+        dlg.destroy()
+        if resp == Gtk.ResponseType.ACCEPT and paths:
+            self._add_to_library(paths)
+
+    def _open_library(self, *_):
+        Gio.AppInfo.launch_default_for_uri(Gio.File.new_for_path(self._library_path()).get_uri(), None)
+
+    def _change_library(self, *_):
+        dlg = Gtk.FileChooserDialog(title="Choose your library folder", transient_for=self,
+                                    action=Gtk.FileChooserAction.SELECT_FOLDER)
+        dlg.add_buttons("_Cancel", Gtk.ResponseType.CANCEL, "_Use this folder", Gtk.ResponseType.ACCEPT)
+        dlg.set_current_folder(self._library_path())
+        resp = dlg.run()
+        folder = dlg.get_filename()
+        dlg.destroy()
+        if resp == Gtk.ResponseType.ACCEPT and folder:
+            cfg = cli.load_config()
+            cfg["library_dir"] = folder
+            cli.save_config(cfg)
+            self._watch_library()
+
+    def _trash_library_file(self, path):
+        try:
+            Gio.File.new_for_path(path).trash(None)
+        except GLib.Error as e:
+            self.show_error("Couldn't move %s to the trash: %s" % (os.path.basename(path), e.message))
+        self.refresh_library()
+
+    # ----- preview
+
+    def _library_row_selected(self, _box, row):
+        if row is not None and hasattr(row, "path"):
+            self.file_list.unselect_all()
+            self._show_preview("local", row.path, os.path.basename(row.path))
+
+    def _screen_row_selected(self, _box, row):
+        if row is not None and hasattr(row, "device_name"):
+            self.lib_list.unselect_all()
+            self._show_preview("screen", (row.device_name, row.device_size), row.device_name)
+
+    def _show_preview(self, kind, key, title):
+        self._preview_gen = getattr(self, "_preview_gen", 0) + 1
+        gen = self._preview_gen
+        self.preview_img.clear()
+        self.preview_caption.set_text("%s\nLoading preview…" % title)
+        self.preview_spinner.start()
+
+        def job():
+            if kind == "local":
+                return library.preview_for_file(key)
+            name, size = key
+
+            def fetch():
+                with self.worker.lock:
+                    with Device() as d:
+                        return d.pull(name, limit=PREVIEW_PULL_BYTES)
+            return library.preview_for_device_file(name, size, fetch)
+
+        def target():
+            try:
+                path, err = job(), None
+            except (DeviceError, media.MediaError, OSError) as e:
+                path, err = None, str(e)
+            GLib.idle_add(self._preview_ready, gen, title, path, err)
+
+        threading.Thread(target=target, daemon=True).start()
+
+    def _preview_ready(self, gen, title, path, err):
+        if gen != self._preview_gen:
+            return False
+        self.preview_spinner.stop()
+        if err:
+            self.preview_caption.set_text("%s\nNo preview: %s" % (title, err))
+            return False
+        try:
+            if path.lower().endswith(".gif"):
+                self.preview_img.set_from_animation(GdkPixbuf.PixbufAnimation.new_from_file(path))
+            else:
+                self.preview_img.set_from_pixbuf(
+                    GdkPixbuf.Pixbuf.new_from_file_at_scale(path, PREVIEW_W, PREVIEW_H, True))
+            self.preview_caption.set_text(title)
+        except GLib.Error as e:
+            self.preview_caption.set_text("%s\nNo preview: %s" % (title, e.message))
+        return False
+
+    # ----- files on the screen
 
     def _playing(self):
         mode = self.work.get("media_mode", "Single")
@@ -232,16 +472,16 @@ class Window(Gtk.ApplicationWindow):
             self.file_list.remove(child)
         playing = self._playing()
         on_device = set()
-        for kind, title in (("media", "Your files"), ("presets", "Built-in clips")):
-            head = Gtk.Label(xalign=0, margin=6)
-            head.set_markup("<b>%s</b>" % title)
+        for kind, title in (("media", "Uploaded"), ("presets", "Built-in clips")):
+            head = Gtk.Label(xalign=0, margin=4)
+            head.set_markup("<small><b>%s</b></small>" % title)
             row = Gtk.ListBoxRow(activatable=False, selectable=False)
             row.add(head)
             self.file_list.add(row)
             if not self.files[kind]:
-                empty = Gtk.Label(label="  (none yet: upload something below)", xalign=0, margin=6)
+                empty = Gtk.Label(label="  (nothing yet: send something from your library)", xalign=0, margin=4)
                 empty.get_style_context().add_class("dim-label")
-                r = Gtk.ListBoxRow(activatable=False)
+                r = Gtk.ListBoxRow(activatable=False, selectable=False)
                 r.add(empty)
                 self.file_list.add(r)
             for f in self.files[kind]:
@@ -254,21 +494,19 @@ class Window(Gtk.ApplicationWindow):
         self.file_list.show_all()
 
     def _file_row(self, name, size, deletable, playing):
-        row = Gtk.ListBoxRow(activatable=False)
-        box = Gtk.Box(spacing=8, margin=4)
+        row = Gtk.ListBoxRow()
+        row.device_name, row.device_size = name, size
+        box = Gtk.Box(spacing=6, margin=3)
         state = playing.get(name)
         mark = Gtk.Label(label={"playing": "▶", "left": "◧", "right": "◨"}.get(state, " "))
-        mark.set_size_request(20, -1)
+        mark.set_size_request(18, -1)
         box.pack_start(mark, False, False, 0)
         lab = Gtk.Label(label=name, xalign=0, ellipsize=3)
-        lab.set_tooltip_text(name)
+        lab.set_tooltip_text("%s\n%.1f MB" % (name, size / 1e6))
         box.pack_start(lab, True, True, 0)
-        sz = Gtk.Label(label="%.1f MB" % (size / 1e6))
-        sz.get_style_context().add_class("dim-label")
-        box.pack_start(sz, False, False, 0)
         for text, tip, cb in (("Play", "Play full screen", lambda *_: self._play(name)),
-                              ("Left", "Dual-screen: play on the left half", lambda *_: self._play_side(name, "left")),
-                              ("Right", "Dual-screen: play on the right half", lambda *_: self._play_side(name, "right"))):
+                              ("L", "Dual-screen: play on the left half", lambda *_: self._play_side(name, "left")),
+                              ("R", "Dual-screen: play on the right half", lambda *_: self._play_side(name, "right"))):
             b = Gtk.Button(label=text)
             b.set_tooltip_text(tip)
             b.connect("clicked", cb)
@@ -322,22 +560,6 @@ class Window(Gtk.ApplicationWindow):
         if resp == Gtk.ResponseType.OK:
             self.run(lambda: self._with_dev(lambda d: d.remove_file(name)), lambda _r: self.refresh(),
                      "Deleting %s…" % name)
-
-    def _choose_upload(self, *_):
-        dlg = Gtk.FileChooserDialog(title="Choose an image, GIF or video", transient_for=self,
-                                    action=Gtk.FileChooserAction.OPEN)
-        dlg.add_buttons("_Cancel", Gtk.ResponseType.CANCEL, "_Upload", Gtk.ResponseType.ACCEPT)
-        flt = Gtk.FileFilter()
-        flt.set_name("Images, GIFs and videos")
-        for pat in ("*.gif", "*.png", "*.jpg", "*.jpeg", "*.mp4", "*.webm", "*.mov", "*.mkv",
-                    "*.GIF", "*.PNG", "*.JPG", "*.JPEG", "*.MP4"):
-            flt.add_pattern(pat)
-        dlg.add_filter(flt)
-        resp = dlg.run()
-        path = dlg.get_filename()
-        dlg.destroy()
-        if resp == Gtk.ResponseType.ACCEPT and path:
-            self._upload(path)
 
     def _upload(self, path):
         w, h = self.screen
@@ -410,10 +632,10 @@ class Window(Gtk.ApplicationWindow):
         self.color_btn = Gtk.ColorButton(halign=Gtk.Align.START)
         self.color_btn.set_size_request(90, -1)
         rgb = layout.get("color", 0xFFFFFF)
-        from gi.repository import Gdk
         self.color_btn.set_rgba(Gdk.RGBA((rgb >> 16 & 255) / 255, (rgb >> 8 & 255) / 255, (rgb & 255) / 255, 1))
         box.pack_start(_row("Text color", self.color_btn, "any color"), False, False, 0)
-        self.font_combo = _combo([(f, f) for f in L.FONTS], layout.get("font", L.FONTS[0]))
+        self.font_combo = _combo([(f, L.FONT_NAMES[f]) for f in L.FONTS],
+                                 layout.get("font") if layout.get("font") in L.FONTS else L.FONTS[0])
         box.pack_start(_row("Font", self.font_combo), False, False, 0)
         self.side_combo = _combo([("left", "Left half"), ("right", "Right half"), ("full", "Full width")],
                                  layout.get("side", "left"))
