@@ -1,7 +1,9 @@
 """frostframe GTK 3 interface: `frostframe gui`."""
 
+import contextlib
 import os
 import subprocess
+import sys
 import threading
 
 import gi
@@ -39,12 +41,14 @@ class Worker:
         self.window = window
         self.lock = threading.Lock()
 
-    def run(self, fn, done=None, busy_text=None):
+    def run(self, fn, done=None, busy_text=None, locked=True):
+        """locked=False: fn takes self.lock itself, only around its device work (so a long
+        conversion doesn't hold up other device actions)."""
         if busy_text:
             self.window.set_busy(busy_text)
 
         def target():
-            with self.lock:
+            with self.lock if locked else contextlib.nullcontext():
                 try:
                     result, error = fn(), None
                 except (DeviceError, media.MediaError, ValueError, OSError) as e:
@@ -150,6 +154,14 @@ class Window(Gtk.ApplicationWindow):
         self.status.get_style_context().add_class("dim-label")
         outer.pack_end(self.status, False, False, 0)
 
+        previous_hook = sys.excepthook
+
+        def excepthook(etype, value, tb):     # errors in GTK callbacks: show them, don't just print
+            previous_hook(etype, value, tb)
+            known = issubclass(etype, (DeviceError, media.MediaError, ValueError, OSError))
+            self.show_error(str(value) if known else "Unexpected error: %s: %s" % (etype.__name__, value))
+        sys.excepthook = excepthook
+
         self.drag_dest_set(Gtk.DestDefaults.ALL, [], Gdk.DragAction.COPY)
         self.drag_dest_add_uri_targets()
         self.connect("drag-data-received", self._on_drop)
@@ -157,6 +169,7 @@ class Window(Gtk.ApplicationWindow):
         self.show_all()
         self.infobar.hide()
         self.progress.hide()
+        self._show_config_problem()
         self._watch_library()
         if page:
             stack.set_visible_child_name(page)
@@ -175,13 +188,18 @@ class Window(Gtk.ApplicationWindow):
         else:
             self.spinner.stop()
 
+    def _show_config_problem(self):
+        problem = cli.config_problem()
+        if problem:
+            self.show_error(problem)
+
     def show_error(self, text):
         self.info_label.set_text(text)
         self.infobar.show()
         self.status.set_text("")
 
-    def run(self, fn, done=None, busy_text=None):
-        self.worker.run(fn, done, busy_text)
+    def run(self, fn, done=None, busy_text=None, locked=True):
+        self.worker.run(fn, done, busy_text, locked)
 
     def refresh(self):
         def load():
@@ -223,6 +241,7 @@ class Window(Gtk.ApplicationWindow):
         self._fill_files()
         self._refresh_play_page()
         self.status.set_text("Connected.")
+        self._show_config_problem()
 
     # --------------------------------------------------------------- media --
 
@@ -355,18 +374,27 @@ class Window(Gtk.ApplicationWindow):
         return row
 
     def _add_to_library(self, paths):
+        """Copy files into the library in the background (big videos take a while)."""
         folder = self._library_path()
-        added, skipped = [], []
-        for p in paths:
-            try:
-                added.append(library.add(folder, p))
-            except (media.MediaError, OSError) as e:
-                skipped.append("%s (%s)" % (os.path.basename(p), e))
-        self.refresh_library()
-        if added:
-            self.status.set_text("Added %d file(s) to your library." % len(added))
-        if skipped:
-            self.show_error("Not added: " + "; ".join(skipped))
+
+        def copy():
+            added, skipped = [], []
+            for p in paths:
+                try:
+                    added.append(library.add(folder, p))
+                except (media.MediaError, OSError) as e:
+                    skipped.append("%s (%s)" % (os.path.basename(p), e))
+            return added, skipped
+
+        def done(res):
+            added, skipped = res
+            self.refresh_library()
+            if added:
+                self.status.set_text("Added %d file(s) to your library." % len(added))
+            if skipped:
+                self.show_error("Not added: " + "; ".join(skipped))
+
+        self.run(copy, done, "Copying %d file(s) into your library…" % len(paths), locked=False)
 
     def _on_drop(self, _w, _ctx, _x, _y, data, _info, _time):
         paths = []
@@ -608,19 +636,25 @@ class Window(Gtk.ApplicationWindow):
 
         def op():
             name, data = media.convert(path, w, h, mode=fit)
-            with Device() as d:
+            cut = media.read_header(data).get("frame_count", 0) >= media.DEFAULT_MAX_SECONDS * media.FPS
+            with self.worker.lock, Device() as d:
                 d.upload(name, data, progress=progress)
                 if play_after:
                     cli.set_playback("manual")
                     cli.play(d, name, side="left" if half else None)
-            return name
+            return name, cut
 
-        def done(name):
-            self.progress.set_text("Uploaded %s" % name)
-            GLib.timeout_add_seconds(3, lambda: self.progress.hide() or False)
+        def done(res):
+            name, cut = res
+            if cut:
+                self.progress.set_text("Uploaded %s (the first %d seconds: longer videos are cut)"
+                                       % (name, media.DEFAULT_MAX_SECONDS))
+            else:
+                self.progress.set_text("Uploaded %s" % name)
+            GLib.timeout_add_seconds(8 if cut else 3, lambda: self.progress.hide() or False)
             self.refresh()
 
-        self.run(op, done, "Converting and uploading %s…" % os.path.basename(path))
+        self.run(op, done, "Converting and uploading %s…" % os.path.basename(path), locked=False)
 
     def _set_progress(self, frac, text):
         self.progress.set_fraction(frac)
@@ -1150,6 +1184,9 @@ class Window(Gtk.ApplicationWindow):
         new = self._ask_name("Rename playlist", old)
         if not new or new == old:
             return
+        if new in pls:
+            self.show_error("There's already a playlist called “%s”. Pick another name." % new)
+            return
         pls[new] = pls.pop(old)
         cfg = cli.load_config()
         cfg["playlists"] = pls
@@ -1168,14 +1205,25 @@ class Window(Gtk.ApplicationWindow):
         name, pls = self._current_playlist()
         if not name:
             return
+        cfg = cli.load_config()
+        pb = cfg.get("playback", {})
+        playing = pb.get("mode") == "playlist" and pb.get("playlist") == name
+        users = cli.playlist_users(cfg, name)
+        notes = ["The clips stay on the screen and in your library."]
+        if playing:
+            notes.append("It's playing now: frostframe switches to manual and the screen keeps the current clip.")
+        if users:
+            notes.append("Automation uses it (%s); that will be skipped until you change it." % users)
         dlg = Gtk.MessageDialog(transient_for=self, modal=True, message_type=Gtk.MessageType.QUESTION,
                                 buttons=Gtk.ButtonsType.OK_CANCEL, text="Delete the playlist “%s”?" % name)
-        dlg.format_secondary_text("The clips stay on the screen and in your library.")
+        dlg.format_secondary_text("\n".join(notes))
         resp = dlg.run()
         dlg.destroy()
         if resp == Gtk.ResponseType.OK:
             pls.pop(name, None)
             self._save_playlists(pls)
+            if playing:
+                cli.set_playback("manual")
             self.pl_combo.set_active(-1)
             self._refresh_play_page()
 
@@ -1220,20 +1268,24 @@ class Window(Gtk.ApplicationWindow):
         w, h = self.screen
 
         def op():
-            names = []
-            uploads = [v for k, v in chosen if k == "library"]
-            with Device() as d:
+            with self.worker.lock, Device() as d:
                 existing = set(os.path.basename(f.get("path", "")) for k in ("media", "presets")
                                for f in d.file_list().get(k, []))
-                for k, v in chosen:
-                    if k == "screen":
-                        names.append(v)
-                        continue
-                    dev_name = media.device_name(v, w, h)
-                    if dev_name not in existing:
-                        dev_name, data = media.convert(v, w, h)
+            names, uploads = [], []
+            for k, v in chosen:
+                if k == "screen":
+                    names.append(v)
+                    continue
+                dev_name = media.device_name(v, w, h)
+                if dev_name not in existing:
+                    dev_name, data = media.convert(v, w, h)     # device stays free meanwhile
+                    uploads.append((dev_name, data))
+                    existing.add(dev_name)
+                names.append(dev_name)
+            if uploads:
+                with self.worker.lock, Device() as d:
+                    for dev_name, data in uploads:
                         d.upload(dev_name, data)
-                    names.append(dev_name)
             return names, len(uploads)
 
         def done(res):
@@ -1246,7 +1298,7 @@ class Window(Gtk.ApplicationWindow):
                                  (", uploaded %d from your library" % uploaded) if uploaded else ""))
             self.refresh()
 
-        self.run(op, done, "Adding clips to %s…" % name)
+        self.run(op, done, "Adding clips to %s…" % name, locked=False)
 
     def _pl_play(self, *_):
         name = self.pl_combo.get_active_text()

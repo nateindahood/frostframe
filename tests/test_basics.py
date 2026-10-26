@@ -95,6 +95,33 @@ class SafetyTests(unittest.TestCase):
         os.close(r)
         os.close(w)
 
+    def test_drain_stops_on_a_device_that_never_stops_sending(self):
+        dev = Device.__new__(Device)
+        dev.fd, dev._buf = os.open("/dev/zero", os.O_RDONLY), b""
+        try:
+            dev._drain()                 # used to loop forever
+        finally:
+            os.close(dev.fd)
+
+    def test_upload_sends_checksum_of_whole_file(self):
+        sent = []
+        dev = Device.__new__(Device)
+        dev._track = 1
+        dev.storage_status = lambda: {}
+
+        def request(name, body=None, track_id=None, timeout=None):
+            sent.append((name, body))
+            return name + "_status", {}
+        dev.request = request
+        data = os.urandom(600 * 1024)    # three chunks
+        dev.upload("x", data)
+        self.assertEqual([n for n, _b in sent], ["file_begin"] + ["file_data"] * 3 + ["file_end"])
+        self.assertEqual(sent[-1][1]["crc"], crc32c(data))
+
+    def test_stuck_ffmpeg_is_stopped(self):
+        with self.assertRaises(media.MediaError):
+            media.run_ffmpeg(["sleep", "5"], timeout=1)
+
     def test_kaleidoscope_counts_as_playing(self):
         work = {"media_mode": "Kaleidoscope", "kaleidoscope_file": "k", "single_file": "s"}
         self.assertEqual(list(cli.playing_files(work)), ["k"])
@@ -125,6 +152,26 @@ class CliValidationTests(unittest.TestCase):
         self.assertEqual(len(cli.load_config()["rules"]["conditions"]), 1)
         self.assertEqual(self.quiet(["auto", "remove", "1"]), 0)
         self.assertEqual(cli.load_config()["rules"]["conditions"], [])
+
+    def test_broken_config_is_never_overwritten(self):
+        with open(cli.CONFIG_FILE, "w") as f:
+            f.write('{"playlists": {"Chill": {}}')          # missing brace
+        self.assertEqual(self.quiet(["stop"]), 1)
+        with open(cli.CONFIG_FILE) as f:
+            self.assertEqual(f.read(), '{"playlists": {"Chill": {}}')
+        self.assertTrue(os.path.exists(cli.CONFIG_FILE + ".bad"))
+        self.assertIn("error", self.err.getvalue())
+
+    def test_deleting_the_playing_playlist_switches_to_manual(self):
+        cli.save_config({"playlists": {"P": {"items": []}}, "playback": {"mode": "playlist", "playlist": "P"}})
+        self.assertEqual(self.quiet(["playlist", "delete", "P"]), 0)
+        cfg = cli.load_config()
+        self.assertEqual(cfg["playlists"], {})
+        self.assertEqual(cfg["playback"]["mode"], "manual")
+
+    def test_label_size_checked(self):
+        self.assertEqual(self.quiet(["--device", "/nonexistent", "labels", "set", "cpu-temp", "--size", "5000"]), 1)
+        self.assertNotIn("nonexistent", self.err.getvalue())
 
     def test_unsafe_cooler_values_refused_before_touching_the_device(self):
         for argv in (["pump", "150"], ["pump", "-1"], ["pump", "10"], ["fan", "fixed", "5"],

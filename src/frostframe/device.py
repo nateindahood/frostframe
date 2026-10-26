@@ -5,6 +5,7 @@ import glob
 import os
 import select
 import struct
+import threading
 import time
 
 from . import protocol as P
@@ -173,7 +174,9 @@ class Device:
         """Drop anything already waiting, e.g. a late reply to a request that timed out,
         so it can't be mistaken for the answer to the next one."""
         self._buf = b""
-        while select.select([self.fd], [], [], 0)[0]:
+        for _ in range(64):         # bounded, in case the device never stops sending
+            if not select.select([self.fd], [], [], 0)[0]:
+                break
             try:
                 if not os.read(self.fd, 1 << 20):
                     break
@@ -301,6 +304,10 @@ class Device:
                               "something first, or make the clip shorter (--seconds)."
                               % (name, len(data) / 1e6, free / 1e6))
         track = self._track = (self._track + 1) & 0xFFFFFFFF
+        # The checksum is slow in pure Python (~70 ms/MB); work it out while the data is sent.
+        crc = {}
+        crc_thread = threading.Thread(target=lambda: crc.update(value=crc32c(data)), daemon=True)
+        crc_thread.start()
         self._expect_status(self.request("file_begin", {"name": name.encode(), "size": len(data)},
                                          track_id=track), "file_begin_status")
         sent = 0
@@ -311,7 +318,8 @@ class Device:
             sent += len(chunk)
             if progress:
                 progress(sent, len(data))
-        self._expect_status(self.request("file_end", {"file_type": file_type.encode(), "crc": crc32c(data)},
+        crc_thread.join()
+        self._expect_status(self.request("file_end", {"file_type": file_type.encode(), "crc": crc["value"]},
                                          track_id=track, timeout=60), "file_end_status")
 
     @staticmethod

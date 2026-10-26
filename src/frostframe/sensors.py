@@ -177,9 +177,10 @@ class Sensors:
         self._cpu = _Rate(_cpu_times)
         self._net = _Rate(_net_bytes)
         self._nv = None           # started on first use
+        self._has_nvidia = shutil.which("nvidia-smi") is not None
 
     def read(self):
-        if self._nv is None and shutil.which("nvidia-smi"):
+        if self._nv is None and self._has_nvidia:
             self._nv = Nvidia()
         (idle, total), (pidle, ptotal) = self._cpu.get()
         load = 100.0 * (1 - (idle - pidle) / (total - ptotal)) if total > ptotal else None

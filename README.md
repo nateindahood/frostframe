@@ -85,7 +85,7 @@ you still need the udev rule from `packaging/`.
 
 | Command | What it does |
 |---|---|
-| `frostframe gui [--page media\|display\|cooler]` | Graphical interface |
+| `frostframe gui [--page media\|playlists\|display\|cooler]` | Graphical interface |
 | `frostframe info` | Model, firmware, serial, screen size |
 | `frostframe files` | Media on the screen (▶ = playing) |
 | `frostframe upload FILE [--play]` | Convert (ffmpeg) and upload a GIF, MP4, PNG or JPEG (path or library file name) |

@@ -66,6 +66,16 @@ class PlaylistTests(unittest.TestCase):
         out = [e.tick(cfg, {}, {"a"}, now=t) for t in range(1, 12)]
         self.assertEqual(set(out), {"a"})
 
+    def test_edit_keeps_position_with_duplicate_clips(self):
+        cfg = {"playback": {"mode": "playlist", "playlist": "p"},
+               "playlists": {"p": {"items": [{"file": "a"}, {"file": "b"}, {"file": "a"}]}}}
+        e = player.Engine(lambda f: 2.0)
+        run(e, cfg, 5)                                   # now on item 3 (the second "a")
+        self.assertEqual(e.state["item"], 3)
+        cfg["playlists"]["p"]["items"][1]["repeats"] = 2
+        e.tick(cfg, {}, {"a", "b"}, now=5)
+        self.assertEqual(e.state["item"], 3)
+
     def test_manual_mode_leaves_screen_alone(self):
         e = player.Engine(DUR.get)
         self.assertEqual(run(e, {"playback": {"mode": "manual"}}, 3), [None] * 3)

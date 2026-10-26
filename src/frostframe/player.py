@@ -104,12 +104,15 @@ class PlaylistRun:
         """The playlist was edited or files came and went: carry on with the current clip
         if it's still there (and still counting its plays), else start the next one."""
         cur = self.current()
+        old_index = self.order[self.pos] if cur else None
         self.items = [it for it in playlist.get("items", []) if it.get("file") in available]
         self.shuffle = bool(playlist.get("shuffle"))
         self.order = list(range(len(self.items)))
         if self.shuffle:
             random.shuffle(self.order)
         same = [i for i, it in enumerate(self.items) if cur and it.get("file") == cur.get("file")]
+        if old_index in same:           # the same clip may be in the list more than once
+            same = [old_index]
         if same:
             self.pos = self.order.index(same[0])
         else:

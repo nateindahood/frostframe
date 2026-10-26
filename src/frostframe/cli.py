@@ -6,6 +6,7 @@ import os
 import shutil
 import signal
 import sys
+import tempfile
 import time
 
 from . import __version__
@@ -30,6 +31,36 @@ FAN_MIN_SAFE = 20
 
 # ----------------------------------------------------------------- helpers ---
 
+def config_problem():
+    """None if the config file is missing or valid, else a message saying what's wrong.
+
+    A broken file is never overwritten (that would throw away the user's playlists and rules);
+    a copy is kept as config.json.bad so the user can fix it."""
+    try:
+        with open(CONFIG_FILE) as f:
+            text = f.read()
+    except OSError:
+        return None
+    try:
+        json.loads(text)
+        return None
+    except ValueError as e:
+        bad = CONFIG_FILE + ".bad"
+        try:
+            with open(bad) as f:
+                saved = f.read() == text
+        except OSError:
+            saved = False
+        if not saved:
+            try:
+                with open(bad, "w") as f:
+                    f.write(text)
+            except OSError:
+                pass
+        return ("%s has an error (%s), so frostframe won't change your settings until it's fixed. "
+                "Fix or delete the file (a copy is in %s)." % (CONFIG_FILE, e, os.path.basename(bad)))
+
+
 def load_config():
     try:
         with open(CONFIG_FILE) as f:
@@ -39,11 +70,18 @@ def load_config():
 
 
 def save_config(cfg):
+    problem = config_problem()
+    if problem:
+        raise ValueError(problem)
     os.makedirs(CONFIG_DIR, exist_ok=True)
-    tmp = CONFIG_FILE + ".tmp"
-    with open(tmp, "w") as f:
-        json.dump(cfg, f, indent=2)
-    os.replace(tmp, CONFIG_FILE)
+    fd, tmp = tempfile.mkstemp(prefix=".config-", suffix=".json", dir=CONFIG_DIR)
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(cfg, f, indent=2)
+        os.replace(tmp, CONFIG_FILE)
+    except BaseException:
+        os.unlink(tmp)
+        raise
 
 
 def open_device(args):
@@ -308,6 +346,8 @@ def cmd_labels(args):
             raise DeviceError("unknown metric(s): %s (see `frostframe labels list`)" % ", ".join(bad))
         if not 1 <= len(args.metrics) <= 4:
             raise DeviceError("choose 1 to 4 metrics")
+        if not 60 <= args.size <= 240:
+            raise DeviceError("--size must be 60-240")
         layout = {"metrics": args.metrics, "side": args.side, "font": args.font,
                   "color": L.parse_color(args.color), "value_size": args.size}
     cfg["layout"] = layout
@@ -448,31 +488,48 @@ def parse_target(dev, cfg, text):
     return "file:" + resolve_file(dev, text)
 
 
+def playlist_users(cfg, name):
+    """Which automation rules use playlist `name`, as text ('' if none)."""
+    rules = cfg.get("rules", {})
+    used = ["rule %d" % i for i, r in enumerate(rules.get("conditions", []), 1) if r.get("target") == "playlist:" + name]
+    if rules.get("otherwise") == "playlist:" + name:
+        used.append("'otherwise'")
+    return ", ".join(used)
+
+
 def describe_target(t):
     return ("playlist %s" % t[9:]) if t.startswith("playlist:") else t[5:] if t.startswith("file:") else str(t)
 
 
-def resolve_or_upload(dev, item):
-    """A file on the screen, or a library file (uploaded on the fly). Returns the device name."""
-    try:
-        return resolve_file(dev, item)
-    except DeviceError:
-        path = item if os.path.isfile(item) else os.path.join(library.library_dir(load_config()), item)
-        if not os.path.isfile(path):
-            raise
-        w, h = dev.screen_size()
-        print("  uploading %s from your library..." % os.path.basename(path))
-        name, data = media.convert(path, w, h)
-        dev.upload(name, data)
-        return name
-
-
-def _parse_items(dev, specs):
-    items = []
+def _parse_items(args, specs):
+    """NAME[:repeats] -> playlist items. A NAME that isn't on the screen but is a file (or a
+    library file) is converted and uploaded. Conversion happens with the device closed, so the
+    background service can keep using it meanwhile."""
+    parsed = []
     for spec in specs:
         name, _, reps = spec.rpartition(":") if ":" in spec and spec.rsplit(":", 1)[1].isdigit() else (spec, "", "1")
-        items.append({"file": resolve_or_upload(dev, name), "repeats": max(1, int(reps or 1))})
-    return items
+        parsed.append([name, max(1, int(reps or 1))])
+    uploads = {}
+    with open_device(args) as dev:
+        w, h = dev.screen_size()
+        for item in parsed:
+            try:
+                item[0] = resolve_file(dev, item[0])
+            except DeviceError:
+                path = item[0] if os.path.isfile(item[0]) else os.path.join(library.library_dir(load_config()), item[0])
+                if not os.path.isfile(path):
+                    raise
+                uploads[item[0]] = path
+    converted = {}
+    for key, path in uploads.items():
+        print("  converting %s from your library..." % os.path.basename(path))
+        converted[key] = media.convert(path, w, h)
+    if converted:
+        with open_device(args) as dev:
+            for name, data in converted.values():
+                print("  uploading %s..." % name)
+                dev.upload(name, data)
+    return [{"file": converted[n][0] if n in converted else n, "repeats": r} for n, r in parsed]
 
 
 def cmd_playlist(args):
@@ -489,11 +546,12 @@ def cmd_playlist(args):
     if args.action in ("create", "add"):
         if not args.items:
             raise DeviceError("give one or more files: NAME or NAME:repeats (from the screen or your library)")
-        with open_device(args) as dev:
-            items = _parse_items(dev, args.items)
+        items = _parse_items(args, args.items)
         cfg = load_config()
         pls = cfg.setdefault("playlists", {})
         if args.action == "create":
+            if args.name in pls:
+                print("(replacing the existing playlist %s)" % args.name)
             pls[args.name] = {"items": items, "shuffle": args.shuffle}
         else:
             pls.setdefault(args.name, {"items": [], "shuffle": args.shuffle})["items"] += items
@@ -505,7 +563,16 @@ def cmd_playlist(args):
         for i, it in enumerate(pl.get("items", []), 1):
             print("  %d. %s  x%d" % (i, it["file"], it.get("repeats", 1)))
     elif args.action == "delete":
-        pls.pop(args.name, None)
+        if args.name not in pls:
+            raise DeviceError("no playlist named %r" % args.name)
+        pls.pop(args.name)
+        pb = cfg.get("playback", {})
+        if pb.get("mode") == "playlist" and pb.get("playlist") == args.name:
+            pb["mode"] = "manual"
+            print("It was playing: switched to manual (the screen keeps the current clip).")
+        users = playlist_users(cfg, args.name)
+        if users:
+            print("Note: automation still uses it (%s); that will be skipped until you change it." % users)
         save_config(cfg)
         print("Deleted playlist %s" % args.name)
     elif args.action == "play":
@@ -706,7 +773,7 @@ def main(argv=None):
     sub = p.add_subparsers(dest="cmd", required=True)
 
     s = sub.add_parser("gui", help="open the graphical interface")
-    s.add_argument("--page", choices=["media", "display", "cooler"], help="tab to open")
+    s.add_argument("--page", choices=["media", "playlists", "display", "cooler"], help="tab to open")
     s.set_defaults(func=cmd_gui)
     sub.add_parser("info", help="show device information").set_defaults(func=cmd_info)
     sub.add_parser("doctor", help="check setup and permissions").set_defaults(func=cmd_doctor)
@@ -762,7 +829,7 @@ def main(argv=None):
     s.add_argument("--side", choices=["left", "right", "full"], default="left")
     s.add_argument("--color", default="white")
     s.add_argument("--font", choices=L.FONTS, default=L.FONTS[0])
-    s.add_argument("--size", type=int, default=160, help="value text size (default 160)")
+    s.add_argument("--size", type=int, default=160, help="value text size, 60-240 (default 160)")
     s.set_defaults(func=cmd_labels)
 
     s = sub.add_parser("monitor", help="background loop: live readings, playlists, automation")

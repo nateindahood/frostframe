@@ -74,7 +74,7 @@ def _gif_preview(cmd_input, out, data=None, h264=False):
     os.close(fd)
     try:
         cmd += ["-i", cmd_input, "-t", str(PREVIEW_SECONDS), "-vf", vf, "-loop", "0", tmp]
-        r = subprocess.run(cmd, input=data, capture_output=True)
+        r = media.run_ffmpeg(cmd, input=data, timeout=120)
         if r.returncode != 0 or not os.path.getsize(tmp):
             raise media.MediaError("couldn't make a preview: %s" % r.stderr.decode(errors="replace").strip()[-300:])
         os.replace(tmp, out)

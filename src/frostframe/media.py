@@ -21,6 +21,7 @@ IMAGE_SECONDS = 2  # still images become a short looping clip
 # Videos are cut to this length unless asked otherwise: every frame is a keyframe, so the
 # device format takes about 3 MB per second, all of it held in memory while uploading.
 DEFAULT_MAX_SECONDS = 60
+CONVERT_TIMEOUT = 15 * 60    # seconds; generous, but a stuck ffmpeg can't hang frostframe forever
 
 
 class MediaError(Exception):
@@ -33,6 +34,13 @@ def ffmpeg_path():
         raise MediaError("ffmpeg is required for converting media. Install it with your package "
                          "manager (e.g. `sudo apt install ffmpeg`).")
     return path
+
+
+def run_ffmpeg(cmd, timeout, **kw):
+    try:
+        return subprocess.run(cmd, capture_output=True, timeout=timeout, **kw)
+    except subprocess.TimeoutExpired:
+        raise MediaError("ffmpeg took longer than %d minutes and was stopped" % (timeout // 60))
 
 
 def device_name(src, width, height):
@@ -80,7 +88,7 @@ def convert(src, width, height, mode="fill", max_seconds=DEFAULT_MAX_SECONDS, qu
             "-f", "h264"]
     with tempfile.TemporaryDirectory(prefix="frostframe-") as tmp:
         out = os.path.join(tmp, "out.h264")
-        r = subprocess.run(cmd + [out], capture_output=True, text=True)
+        r = run_ffmpeg(cmd + [out], timeout=CONVERT_TIMEOUT, text=True)
         if r.returncode != 0:
             raise MediaError("ffmpeg failed: %s" % (r.stderr.strip()[-500:] or r.returncode))
         with open(out, "rb") as f:
@@ -119,8 +127,8 @@ def count_frames(stream):
 def extract_mp4(device_file, out):
     """Turn a device media file (header + raw H.264) into a playable .mp4 (no re-encode)."""
     out = os.path.abspath(out)    # never let a name starting with "-" look like an option
-    r = subprocess.run([ffmpeg_path(), "-hide_banner", "-loglevel", "error", "-y", "-f", "h264", "-r", str(FPS),
-                        "-i", "pipe:0", "-c", "copy", out], input=device_file, capture_output=True)
+    r = run_ffmpeg([ffmpeg_path(), "-hide_banner", "-loglevel", "error", "-y", "-f", "h264", "-r", str(FPS),
+                    "-i", "pipe:0", "-c", "copy", out], input=device_file, timeout=5 * 60)
     if r.returncode != 0:
         raise MediaError("ffmpeg failed: %s" % r.stderr.decode(errors="replace").strip()[-300:])
     return out
