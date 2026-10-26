@@ -9,16 +9,20 @@ import gi
 gi.require_version("Gtk", "3.0")
 gi.require_version("Gdk", "3.0")
 gi.require_version("GdkPixbuf", "2.0")
-from gi.repository import Gdk, GdkPixbuf, Gio, GLib, Gtk  # noqa: E402
+gi.require_version("Pango", "1.0")
+gi.require_version("PangoCairo", "1.0")
+from gi.repository import Gdk, GdkPixbuf, Gio, GLib, Gtk, Pango, PangoCairo  # noqa: E402
 
 from . import __version__  # noqa: E402
 from . import cli  # noqa: E402
+from . import fonts  # noqa: E402
 from . import labels as L  # noqa: E402
 from . import library  # noqa: E402
 from . import media  # noqa: E402
 from .device import Device, DeviceError, find_devices  # noqa: E402
 
 SERVICE = "frostframe-monitor.service"
+SCREEN_PREVIEW_W = 448
 PREVIEW_W, PREVIEW_H = 380, 240
 PREVIEW_PULL_BYTES = 4 * 1024 * 1024   # the first few seconds of a clip are enough for a preview
 METRIC_NAMES = {"": "(none)", "cpu-temp": "CPU temperature", "cpu-load": "CPU usage",
@@ -603,7 +607,23 @@ class Window(Gtk.ApplicationWindow):
     # ------------------------------------------------------------- display --
 
     def _display_page(self):
-        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8, margin=16)
+        page = Gtk.Box(spacing=24, margin=16)
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        page.pack_start(box, True, True, 0)
+        right = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        right.pack_start(_section("How it will look"), False, False, 0)
+        self.screen_preview = Gtk.DrawingArea()
+        self.screen_preview.set_size_request(SCREEN_PREVIEW_W, SCREEN_PREVIEW_W * 1080 // 2240)
+        self.screen_preview.connect("draw", self._draw_screen_preview)
+        frame = Gtk.Frame()
+        frame.add(self.screen_preview)
+        right.pack_start(frame, False, False, 0)
+        note = Gtk.Label(label="Approximate: the cooler draws the text itself,\nusing the same fonts.",
+                         xalign=0)
+        note.get_style_context().add_class("dim-label")
+        right.pack_start(note, False, False, 0)
+        page.pack_start(right, False, False, 0)
+        self._last_readings = {}
         box.pack_start(_section("Screen"), False, False, 0)
         self.brightness = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0, 100, 5)
         self.brightness.set_value_pos(Gtk.PositionType.RIGHT)
@@ -629,19 +649,23 @@ class Window(Gtk.ApplicationWindow):
             box.pack_start(_row("Reading %d" % (i + 1), row), False, False, 0)
             self.metric_combos.append(c)
             self.metric_values.append(v)
+            c.connect("changed", lambda *_: self.screen_preview.queue_draw())
         self.color_btn = Gtk.ColorButton(halign=Gtk.Align.START)
         self.color_btn.set_size_request(90, -1)
         rgb = layout.get("color", 0xFFFFFF)
         self.color_btn.set_rgba(Gdk.RGBA((rgb >> 16 & 255) / 255, (rgb >> 8 & 255) / 255, (rgb & 255) / 255, 1))
+        self.color_btn.connect("color-set", lambda *_: self.screen_preview.queue_draw())
         box.pack_start(_row("Text color", self.color_btn, "any color"), False, False, 0)
-        self.font_combo = _combo([(f, L.FONT_NAMES[f]) for f in L.FONTS],
-                                 layout.get("font") if layout.get("font") in L.FONTS else L.FONTS[0])
+        self.font_combo = self._font_combo(layout.get("font") if layout.get("font") in L.FONTS else L.FONTS[0])
+        self.font_combo.connect("changed", lambda *_: self.screen_preview.queue_draw())
         box.pack_start(_row("Font", self.font_combo), False, False, 0)
         self.side_combo = _combo([("left", "Left half"), ("right", "Right half"), ("full", "Full width")],
                                  layout.get("side", "left"))
+        self.side_combo.connect("changed", lambda *_: self.screen_preview.queue_draw())
         box.pack_start(_row("Position", self.side_combo), False, False, 0)
         self.size_spin = Gtk.SpinButton.new_with_range(60, 240, 10)
         self.size_spin.set_value(layout.get("value_size", 160))
+        self.size_spin.connect("value-changed", lambda *_: self.screen_preview.queue_draw())
         box.pack_start(_row("Number size", self.size_spin), False, False, 0)
 
         actions = Gtk.Box(spacing=8)
@@ -658,7 +682,58 @@ class Window(Gtk.ApplicationWindow):
         self.service_switch.connect("notify::active", self._service_toggled)
         box.pack_start(_row("Keep readings live", self.service_switch,
                             "background service, starts at login"), False, False, 0)
-        return box
+        return page
+
+    @staticmethod
+    def _font_combo(active):
+        """Font picker that shows each font name in that font."""
+        store = Gtk.ListStore(str, str, str)   # device font id, display name, Pango family
+        for fid in L.FONTS:
+            store.append([fid, L.FONT_NAMES[fid], fonts.family(fid)])
+        combo = Gtk.ComboBox(model=store, id_column=0)
+        cell = Gtk.CellRendererText(size_points=15)
+        combo.pack_start(cell, True)
+        combo.add_attribute(cell, "text", 1)
+        combo.add_attribute(cell, "family", 2)
+        combo.set_active_id(active)
+        return combo
+
+    def _draw_screen_preview(self, area, cr):
+        """Miniature of the cooler screen showing the readings layout as it will be sent."""
+        w = area.get_allocated_width()
+        h = area.get_allocated_height()
+        cr.set_source_rgb(0, 0, 0)
+        cr.paint()
+        layout = self._layout_from_ui()
+        scale = w / 2240.0
+        rgb = layout["color"]
+        cr.set_source_rgb((rgb >> 16 & 255) / 255, (rgb >> 8 & 255) / 255, (rgb & 255) / 255)
+        family = fonts.family(layout["font"])
+        run = L.build_run_config(layout, 2240, 1080)
+        values = L.values_update(layout, self._last_readings)
+
+        def text(t, size_px, x, y):
+            pl = PangoCairo.create_layout(cr)
+            fd = Pango.FontDescription.from_string(family)
+            fd.set_absolute_size(max(1.0, size_px * scale) * Pango.SCALE)
+            pl.set_font_description(fd)
+            pl.set_text(t, -1)
+            cr.move_to(x, y)
+            PangoCairo.show_layout(cr, pl)
+            _ink, logical = pl.get_pixel_extents()
+            return logical.width, logical.height
+
+        for g in run["groups"]:
+            title, value, unit = g["labels"]
+            gx, gy = g["x"] * scale, g["y"] * scale
+            _tw, th = text(title["text"], title["size"], gx + title.get("gap_left", 0) * scale, gy)
+            vtext = values.get(g["id"], {}).get(value["id"], "--")
+            vw, vh = text(vtext, value["size"], gx, gy + th * 0.9)
+            text(unit["text"], unit["size"], gx + vw + 6 * scale, gy + th * 0.9 + vh - unit["size"] * scale * 1.6)
+        if not run["groups"]:
+            cr.set_source_rgb(0.5, 0.5, 0.5)
+            text("No readings selected", 60, 20, h / 2 - 20)
+        return False
 
     def _brightness_changed(self, scale):
         if getattr(self, "_loading", False):
@@ -729,6 +804,8 @@ class Window(Gtk.ApplicationWindow):
             from .sensors import Sensors
             self._sensors = Sensors()
         r = self._sensors.read()
+        self._last_readings = r
+        self.screen_preview.queue_draw()
         for combo, lab in zip(self.metric_combos, self.metric_values):
             m = combo.get_active_id()
             if m and m in L.METRICS:
@@ -793,6 +870,7 @@ class App(Gtk.Application):
 
 
 def main(page=None):
+    fonts.register()   # before any text is laid out, so previews can use the screen's fonts
     GLib.set_prgname("frostframe")
     GLib.set_application_name("frostframe %s" % __version__)
     return App(page).run([])

@@ -24,9 +24,11 @@ the same features, plus:
   **Send to screen** in one click.
 - **Preview**: select any file, in your library *or already on the screen* (built-in clips
   too), to see it animate in the preview box.
-- Media on the screen with play / dual-screen left & right / delete, brightness, on-screen
-  readings with any text color and all four built-in fonts, the background-service switch,
-  and cooler settings.
+- **Readings designer**: pick readings, any text color, size and position, and one of the four
+  fonts built into the screen. The font menu shows each font as it looks, and a miniature
+  of the screen shows how your readings will look before you apply them.
+- Media on the screen with play / dual-screen left & right / delete, brightness, the
+  background-service switch, and cooler settings.
 
 > **Unofficial, independent project.** frostframe is not affiliated with, endorsed by or
 > supported by the cooler's manufacturer. Product and company names mentioned here belong to
@@ -150,3 +152,9 @@ the offline tests.
 ## License
 
 MIT, see [LICENSE](LICENSE).
+
+The GUI bundles copies of the four fonts the screen firmware uses, only for previewing them:
+[Roboto](https://fonts.google.com/specimen/Roboto), [Bitcount Single](https://fonts.google.com/specimen/Bitcount+Single),
+[Orbitron](https://fonts.google.com/specimen/Orbitron) and [Rubik Glitch](https://fonts.google.com/specimen/Rubik+Glitch),
+from Google Fonts under the SIL Open Font License 1.1 (license texts in `src/frostframe/fonts/`).
+They are loaded for frostframe only, not installed system-wide.
