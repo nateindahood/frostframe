@@ -33,11 +33,14 @@ def ffmpeg_path():
 
 
 def device_name(src, width, height):
-    """File name on the device: <stem>.<ext>.h264_<W>x<H> (ASCII, no spaces)."""
+    """File name on the device: <stem>.<ext>.h264_<W>x<H> (lowercase ASCII, no spaces).
+
+    Lowercase because an upload with capital letters in its name once disappeared from the
+    device after a power cut while lowercase ones survived (under investigation)."""
     stem, ext = os.path.splitext(os.path.basename(src))
     stem = re.sub(r"[^A-Za-z0-9_-]+", "_", stem).strip("_")[:48] or "media"
     ext = (ext.lstrip(".").lower() or "bin")[:5]
-    return "%s.%s.h264_%dx%d" % (stem, ext, width, height)
+    return ("%s.%s.h264_%dx%d" % (stem, ext, width, height)).lower()
 
 
 def _video_filter(mode, width, height):

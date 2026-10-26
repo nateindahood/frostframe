@@ -315,6 +315,14 @@ def cmd_dump(args):
     print(json.dumps(jsonable(out), indent=2, ensure_ascii=False))
 
 
+def cmd_gui(args):
+    try:
+        from .gui import main as gui_main
+    except (ImportError, ValueError) as e:
+        raise DeviceError("the GUI needs GTK 3 for Python (python3-gi, gir1.2-gtk-3.0): %s" % e)
+    return gui_main(args.page)
+
+
 def cmd_doctor(args):
     ok = True
     devs = find_devices()
@@ -358,6 +366,9 @@ def main(argv=None):
     p.add_argument("--device", help="device node (default: auto-detect)")
     sub = p.add_subparsers(dest="cmd", required=True)
 
+    s = sub.add_parser("gui", help="open the graphical interface")
+    s.add_argument("--page", choices=["media", "display", "cooler"], help="tab to open")
+    s.set_defaults(func=cmd_gui)
     sub.add_parser("info", help="show device information").set_defaults(func=cmd_info)
     sub.add_parser("doctor", help="check setup and permissions").set_defaults(func=cmd_doctor)
     sub.add_parser("files", help="list media on the screen").set_defaults(func=cmd_files)

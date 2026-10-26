@@ -11,9 +11,11 @@ BIN="$HOME/.local/bin/frostframe"
 UNIT_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
 RULE="/etc/udev/rules.d/70-frostframe.rules"
 
+APPS="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
+
 if [ "${1:-}" = "--uninstall" ]; then
     systemctl --user disable --now frostframe-monitor.service 2>/dev/null || true
-    rm -f "$UNIT_DIR/frostframe-monitor.service" "$BIN"
+    rm -f "$UNIT_DIR/frostframe-monitor.service" "$BIN" "$APPS/frostframe.desktop"
     rm -rf "$LIB"
     [ -f "$RULE" ] && sudo rm -f "$RULE" && sudo udevadm control --reload
     echo "frostframe uninstalled (your settings in ~/.config/frostframe were kept)."
@@ -32,6 +34,11 @@ cat >"$BIN" <<EOF
 exec python3 -I -c "import sys; sys.path.insert(0, '$LIB'); from frostframe.cli import main; sys.exit(main(sys.argv[1:]))" "\$@"
 EOF
 chmod +x "$BIN"
+mkdir -p "$APPS"
+sed "s|^Exec=frostframe|Exec=$BIN|" "$HERE/packaging/frostframe.desktop" >"$APPS/frostframe.desktop"
+command -v update-desktop-database >/dev/null && update-desktop-database "$APPS" 2>/dev/null || true
+python3 -c "import gi; gi.require_version('Gtk', '3.0')" 2>/dev/null \
+    || echo "Note: the GUI needs GTK 3 for Python (e.g. sudo apt install python3-gi gir1.2-gtk-3.0)."
 
 if ! cmp -s "$HERE/packaging/70-frostframe.rules" "$RULE" 2>/dev/null; then
     echo "==> Installing udev rule $RULE (needs sudo)"

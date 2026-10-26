@@ -65,7 +65,7 @@ class MediaTests(unittest.TestCase):
         self.assertEqual(media.count_frames((aud + idr) * 3), 3)
 
     def test_device_name(self):
-        self.assertEqual(media.device_name("/x/My Cat (1).GIF", 1120, 1080), "My_Cat_1.gif.h264_1120x1080")
+        self.assertEqual(media.device_name("/x/My Cat (1).GIF", 1120, 1080), "my_cat_1.gif.h264_1120x1080")
 
     def test_header_roundtrip(self):
         hdr = wire.encode(P.MEDIA_HEADER, {"magic": P.MEDIA_MAGIC, "payload_format": "H264Raw",

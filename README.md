@@ -16,6 +16,10 @@ $ frostframe labels set cpu-temp cpu-load gpu-temp --color cyan
 $ frostframe monitor        # or: ./install.sh --service
 ```
 
+Prefer clicking? `frostframe gui` (or **frostframe** in your app menu) opens a GTK window with
+the same features: media library with upload/play/delete, dual-screen, brightness, on-screen
+readings with any text color, the background service switch, and cooler settings.
+
 > **Unofficial, independent project.** frostframe is not affiliated with, endorsed by or
 > supported by the cooler's manufacturer. Product and company names mentioned here belong to
 > their owners and are used only to describe compatibility. It talks to the device using the
@@ -44,7 +48,8 @@ doing that update from Linux via a Windows VM.
 
 ## Install
 
-Requirements: Linux with udev, **Python 3.8+**, **ffmpeg** (for uploads). Optional:
+Requirements: Linux with udev, **Python 3.8+**, **ffmpeg** (for uploads). For the GUI:
+GTK 3 for Python (`python3-gi` + `gir1.2-gtk-3.0`, preinstalled on most desktops). Optional:
 `nvidia-smi` (comes with the NVIDIA driver) for NVIDIA GPU readings. AMD GPUs are read
 through the `amdgpu` driver.
 
@@ -66,6 +71,7 @@ you still need the udev rule from `packaging/`.
 
 | Command | What it does |
 |---|---|
+| `frostframe gui [--page media\|display\|cooler]` | Graphical interface |
 | `frostframe info` | Model, firmware, serial, screen size |
 | `frostframe files` | Media on the screen (▶ = playing) |
 | `frostframe upload FILE [--play]` | Convert (ffmpeg) and upload a GIF, MP4, PNG or JPEG |
@@ -98,6 +104,10 @@ gpu-clock gpu-power ram net-down net-up time date`.
   `frostframe cooler` shows 0 RPM, they're probably on motherboard headers; control them in the
   BIOS or with your motherboard's Linux tools instead.
 - **Firmware updates** aren't supported. They use the manufacturer's tools.
+- **Black screen?** The screen is set to play a file that's no longer on it. `frostframe files`
+  (or the GUI) points this out; pick another file to play.
+- **Never send the device's "Reboot" system command** (not exposed by frostframe): on current
+  firmware it leaves the screen in its flashing mode until the PC's power supply is switched off.
 - **Store content** from the manufacturer's online library (delivered encrypted) isn't supported.
   Your own images and videos are.
 
@@ -117,6 +127,7 @@ documented in [docs/PROTOCOL.md](docs/PROTOCOL.md).
 | Play / switch media, dual-screen mode | ✅ tested |
 | On-screen live readings (labels + monitor) | ✅ tested |
 | Upload (GIF/MP4/PNG/JPEG → H.264) | ✅ tested |
+| GUI (GTK 3) | ✅ tested on Cinnamon |
 | Fan/pump settings | ⚠️ accepted by the device; effect untested (fans on motherboard on the test system) |
 | RGB light settings, live frame streaming | 🔜 in the protocol, not implemented yet |
 

@@ -1,0 +1,10 @@
+[Desktop Entry]
+Name=frostframe
+Comment=Control your AIO cooler's LCD screen
+Exec=frostframe gui
+Icon=video-display
+Terminal=false
+Type=Application
+Categories=Utility;Settings;HardwareSettings;
+Keywords=cooler;AIO;LCD;screen;GIF;
+StartupWMClass=frostframe
