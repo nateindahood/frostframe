@@ -18,6 +18,7 @@ from . import cli  # noqa: E402
 from . import fonts  # noqa: E402
 from . import labels as L  # noqa: E402
 from . import library  # noqa: E402
+from . import player  # noqa: E402
 from . import media  # noqa: E402
 from .device import Device, DeviceError, find_devices  # noqa: E402
 
@@ -59,6 +60,14 @@ class Worker:
         elif done:
             done(result)
         return False
+
+
+def _narrow(combo, chars=16):
+    """Keep a combo box from growing to fit its longest entry."""
+    for cell in combo.get_cells():
+        cell.set_property("ellipsize", 3)
+        cell.set_property("width-chars", chars)
+    return combo
 
 
 def _combo(options, active=None):
@@ -129,6 +138,7 @@ class Window(Gtk.ApplicationWindow):
         outer.pack_start(switcher, False, False, 0)
         outer.pack_start(stack, True, True, 0)
         stack.add_titled(self._media_page(), "media", "Media")
+        stack.add_titled(self._playlists_page(), "playlists", "Playlists & automation")
         stack.add_titled(self._display_page(), "display", "Display & readings")
         stack.add_titled(self._cooler_page(), "cooler", "Cooler")
         self.stack = stack
@@ -149,6 +159,7 @@ class Window(Gtk.ApplicationWindow):
             stack.set_visible_child_name(page)
         self.refresh()
         GLib.timeout_add_seconds(2, self._tick_readings)
+        GLib.timeout_add_seconds(2, self._tick_now_playing)
         self._sensors = None
 
     # ------------------------------------------------------------ helpers --
@@ -206,6 +217,7 @@ class Window(Gtk.ApplicationWindow):
             if not st.get("fan_rpm") and not st.get("pump_rpm") else ""))
         self._loading = False
         self._fill_files()
+        self._refresh_play_page()
         self.status.set_text("Connected.")
 
     # --------------------------------------------------------------- media --
@@ -540,11 +552,13 @@ class Window(Gtk.ApplicationWindow):
         return {"single": "Single", "all": "MediaAll", "random": "MediaRand"}[self.loop_combo.get_active_id()]
 
     def _play(self, name):
+        cli.set_playback("manual")
         loop = self._loop_mode()
         self.run(lambda: self._with_dev(lambda d: cli.play(d, name, loop=loop)),
                  lambda _r: self.refresh(), "Switching to %s…" % name)
 
     def _play_side(self, name, side):
+        cli.set_playback("manual")
         loop = self._loop_mode()
 
         def op(d):
@@ -594,6 +608,7 @@ class Window(Gtk.ApplicationWindow):
             with Device() as d:
                 d.upload(name, data, progress=progress)
                 if play_after:
+                    cli.set_playback("manual")
                     cli.play(d, name, side="left" if half else None)
             return name
 
@@ -825,6 +840,461 @@ class Window(Gtk.ApplicationWindow):
             else:
                 lab.set_text("")
         return True
+
+    # ------------------------------------------------- playlists & rules --
+
+    def _playlists_page(self):
+        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10, margin=14)
+        top = Gtk.Box(spacing=10)
+        top.pack_start(_heading("What controls the screen:"), False, False, 0)
+        self.mode_combo = _combo([("manual", "Manual (I pick what plays)"), ("playlist", "A playlist"),
+                                  ("rules", "Automation (by temperature / usage)")])
+        self.mode_combo.connect("changed", self._mode_changed)
+        top.pack_start(self.mode_combo, False, False, 0)
+        self.now_label = Gtk.Label(xalign=0, ellipsize=3)
+        self.now_label.get_style_context().add_class("dim-label")
+        top.pack_start(self.now_label, True, True, 0)
+        outer.pack_start(top, False, False, 0)
+
+        cols = Gtk.Paned(orientation=Gtk.Orientation.HORIZONTAL, position=560, wide_handle=True)
+        outer.pack_start(cols, True, True, 0)
+
+        # --- playlists
+        left = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        left.pack_start(_section("Playlists"), False, False, 0)
+        bar = Gtk.Box(spacing=6)
+        self.pl_combo = _narrow(Gtk.ComboBoxText(), 12)
+        self.pl_combo.connect("changed", lambda *_: self._fill_playlist_items())
+        bar.pack_start(self.pl_combo, True, True, 0)
+        for label, cb in (("New…", self._pl_new), ("Rename…", self._pl_rename), ("Delete", self._pl_delete)):
+            b = Gtk.Button(label=label)
+            b.connect("clicked", cb)
+            bar.pack_start(b, False, False, 0)
+        left.pack_start(bar, False, False, 0)
+        self.pl_items = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE)
+        ph = Gtk.Label(label="No clips yet. Use “Add clips…” below.")
+        ph.get_style_context().add_class("dim-label")
+        ph.show()
+        self.pl_items.set_placeholder(ph)
+        sc = Gtk.ScrolledWindow(vexpand=True)
+        sc.add(self.pl_items)
+        left.pack_start(sc, True, True, 0)
+        bar2 = Gtk.Box(spacing=6)
+        add = Gtk.Button(label="Add clips…")
+        add.connect("clicked", self._pl_add_dialog)
+        bar2.pack_start(add, False, False, 0)
+        self.pl_order = _combo([("seq", "Play in order"), ("shuffle", "Shuffle")])
+        self.pl_order.connect("changed", self._pl_order_changed)
+        bar2.pack_start(self.pl_order, False, False, 0)
+        playb = Gtk.Button(label="Play this playlist")
+        playb.get_style_context().add_class("suggested-action")
+        playb.connect("clicked", self._pl_play)
+        bar2.pack_end(playb, False, False, 0)
+        left.pack_start(bar2, False, False, 0)
+        hint = Gtk.Label(label="“× N” plays a clip N times before moving to the next.", xalign=0)
+        hint.get_style_context().add_class("dim-label")
+        left.pack_start(hint, False, False, 0)
+        left.set_margin_end(12)
+        cols.pack1(left, True, False)
+
+        # --- automation
+        right = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        right.pack_start(_section("Automation"), False, False, 0)
+        expl = Gtk.Label(label="Rules are checked top to bottom; the first one that matches decides what plays.",
+                         xalign=0, wrap=True)
+        expl.get_style_context().add_class("dim-label")
+        right.pack_start(expl, False, False, 0)
+        self.rule_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        right.pack_start(self.rule_box, False, False, 0)
+        addr = Gtk.Button(label="Add rule", halign=Gtk.Align.START)
+        addr.connect("clicked", lambda *_: self._add_rule_row({}))
+        right.pack_start(addr, False, False, 0)
+        ow = Gtk.Box(spacing=8)
+        ow.pack_start(Gtk.Label(label="Otherwise play"), False, False, 0)
+        self.otherwise_combo = _narrow(Gtk.ComboBoxText(), 14)
+        ow.pack_start(self.otherwise_combo, True, True, 0)
+        right.pack_start(ow, False, False, 0)
+        self.hold_spin = Gtk.SpinButton.new_with_range(3, 600, 1)
+        self.hold_spin.set_halign(Gtk.Align.START)
+        self.hold_spin.set_tooltip_text("How many seconds a condition must last before the clip changes")
+        right.pack_start(_row("Wait before switching (s)", self.hold_spin), False, False, 0)
+        self.hyst_spin = Gtk.SpinButton.new_with_range(0, 30, 1)
+        self.hyst_spin.set_halign(Gtk.Align.START)
+        self.hyst_spin.set_tooltip_text("Once a rule is on, it stays on until the value drops this far "
+                                        "past its limit. Stops flicker near the limit.")
+        right.pack_start(_row("Switch-back margin", self.hyst_spin), False, False, 0)
+        btns = Gtk.Box(spacing=8)
+        save = Gtk.Button(label="Save rules")
+        save.connect("clicked", lambda *_: self._save_rules(False))
+        btns.pack_start(save, False, False, 0)
+        on = Gtk.Button(label="Save and turn automation on")
+        on.get_style_context().add_class("suggested-action")
+        on.connect("clicked", lambda *_: self._save_rules(True))
+        btns.pack_start(on, False, False, 0)
+        right.pack_start(btns, False, False, 0)
+        right.set_margin_start(12)
+        scr = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.AUTOMATIC, vscrollbar_policy=Gtk.PolicyType.AUTOMATIC)
+        scr.add(right)
+        cols.pack2(scr, True, True)
+        self._rule_rows = []
+        return outer
+
+    # ----- shared helpers
+
+    def _screen_files(self):
+        return [os.path.basename(f.get("path", "")) for k in ("media", "presets") for f in self.files.get(k, [])]
+
+    def _targets(self):
+        cfg = cli.load_config()
+        return ([("playlist:" + n, "Playlist: " + n) for n in cfg.get("playlists", {})] +
+                [("file:" + f, f.split(".h264_")[0]) for f in self._screen_files()])
+
+    def _fill_target_combo(self, combo, active):
+        combo.remove_all()
+        for tid, label in self._targets():
+            combo.append(tid, label)
+        if active:
+            combo.set_active_id(active)
+
+    def _refresh_play_page(self):
+        cfg = cli.load_config()
+        self._loading_play = True
+        self.mode_combo.set_active_id(cfg.get("playback", {}).get("mode", "manual"))
+        cur = self.pl_combo.get_active_text() or cfg.get("playback", {}).get("playlist")
+        self.pl_combo.remove_all()
+        for n in cfg.get("playlists", {}):
+            self.pl_combo.append(n, n)
+        if cur in cfg.get("playlists", {}):
+            self.pl_combo.set_active_id(cur)
+        elif cfg.get("playlists"):
+            self.pl_combo.set_active(0)
+        self._fill_playlist_items()
+        rules = cfg.get("rules", {})
+        for row in self._rule_rows:
+            self.rule_box.remove(row["box"])
+        self._rule_rows = []
+        for r in rules.get("conditions", []):
+            self._add_rule_row(r)
+        self._fill_target_combo(self.otherwise_combo, rules.get("otherwise"))
+        self.hold_spin.set_value(rules.get("hold", 10))
+        self.hyst_spin.set_value(rules.get("hysteresis", 3))
+        self._loading_play = False
+
+    def _mode_changed(self, combo):
+        if getattr(self, "_loading_play", False):
+            return
+        mode = combo.get_active_id()
+        if mode == "playlist":
+            name = self.pl_combo.get_active_text()
+            if not name:
+                self.show_error("Create a playlist first.")
+                self._refresh_play_page()
+                return
+            cli.set_playback("playlist", name)
+        else:
+            cli.set_playback(mode)
+        if mode != "manual":
+            self._ensure_service()
+
+    def _ensure_service(self):
+        if not self._service_active():
+            r = subprocess.run(["systemctl", "--user", "enable", "--now", SERVICE], capture_output=True, text=True)
+            if r.returncode != 0:
+                self.show_error("Playlists and automation need the background service: %s\\n"
+                                "Install it with ./install.sh --service." % r.stderr.strip())
+                return
+            self.service_switch.set_active(True)
+
+    def _tick_now_playing(self):
+        st = cli.read_state()
+        cfg = cli.load_config()
+        mode = cfg.get("playback", {}).get("mode", "manual")
+        if mode == "manual":
+            text = "You choose what plays (Media tab)."
+        elif not st:
+            text = "Background service not running: turn on “Keep readings live” on the Display tab."
+        elif st.get("file"):
+            text = "Now: " + st["file"].split(".h264_")[0]
+            if st.get("items"):
+                text += "  ·  clip %d of %d, play %d of %d" % (st["item"], st["items"], st.get("repeat", 1),
+                                                               st.get("repeats", 1))
+            if mode == "rules":
+                text += "  ·  rule: %s" % ("#%d" % (st["rule"] + 1) if st.get("rule") is not None else "otherwise")
+        else:
+            text = st.get("note") or st.get("error") or ""
+        self.now_label.set_text(text)
+        return True
+
+    # ----- playlists
+
+    def _save_playlists(self, pls):
+        cfg = cli.load_config()
+        cfg["playlists"] = pls
+        cli.save_config(cfg)
+
+    def _current_playlist(self):
+        name = self.pl_combo.get_active_text()
+        pls = cli.load_config().get("playlists", {})
+        return name, pls
+
+    def _fill_playlist_items(self):
+        for c in self.pl_items.get_children():
+            self.pl_items.remove(c)
+        name, pls = self._current_playlist()
+        pl = pls.get(name, {}) if name else {}
+        self._loading_play_order = True
+        self.pl_order.set_active_id("shuffle" if pl.get("shuffle") else "seq")
+        self._loading_play_order = False
+        on_screen = set(self._screen_files())
+        for i, it in enumerate(pl.get("items", [])):
+            row = Gtk.ListBoxRow()
+            box = Gtk.Box(spacing=6, margin=3)
+            lab = Gtk.Label(label=it["file"].split(".h264_")[0], xalign=0, ellipsize=3)
+            lab.set_tooltip_text(it["file"] + ("" if it["file"] in on_screen or not on_screen
+                                               else "\\n(not on the screen any more: skipped)"))
+            if on_screen and it["file"] not in on_screen:
+                lab.get_style_context().add_class("dim-label")
+            box.pack_start(lab, True, True, 0)
+            box.pack_start(Gtk.Label(label="×"), False, False, 0)
+            spin = Gtk.SpinButton.new_with_range(1, 99, 1)
+            spin.set_width_chars(2)
+            spin.set_value(it.get("repeats", 1))
+            spin.connect("value-changed", lambda w, i=i: self._pl_edit(i, repeats=int(w.get_value())))
+            box.pack_start(spin, False, False, 0)
+            for icon, tip, delta in (("go-up-symbolic", "Move up", -1), ("go-down-symbolic", "Move down", 1)):
+                b = Gtk.Button.new_from_icon_name(icon, Gtk.IconSize.BUTTON)
+                b.set_tooltip_text(tip)
+                b.connect("clicked", lambda _b, i=i, d=delta: self._pl_move(i, d))
+                box.pack_start(b, False, False, 0)
+            rm = Gtk.Button.new_from_icon_name("list-remove-symbolic", Gtk.IconSize.BUTTON)
+            rm.set_tooltip_text("Remove from playlist")
+            rm.connect("clicked", lambda _b, i=i: self._pl_edit(i, remove=True))
+            box.pack_start(rm, False, False, 0)
+            row.add(box)
+            self.pl_items.add(row)
+        self.pl_items.show_all()
+
+    def _pl_edit(self, i, repeats=None, remove=False):
+        name, pls = self._current_playlist()
+        items = pls.get(name, {}).get("items", [])
+        if not 0 <= i < len(items):
+            return
+        if remove:
+            items.pop(i)
+        elif repeats is not None:
+            items[i]["repeats"] = repeats
+        self._save_playlists(pls)
+        if remove:
+            self._fill_playlist_items()
+
+    def _pl_move(self, i, delta):
+        name, pls = self._current_playlist()
+        items = pls.get(name, {}).get("items", [])
+        j = i + delta
+        if 0 <= j < len(items):
+            items[i], items[j] = items[j], items[i]
+            self._save_playlists(pls)
+            self._fill_playlist_items()
+
+    def _pl_order_changed(self, combo):
+        if getattr(self, "_loading_play_order", False):
+            return
+        name, pls = self._current_playlist()
+        if name in pls:
+            pls[name]["shuffle"] = combo.get_active_id() == "shuffle"
+            self._save_playlists(pls)
+
+    def _ask_name(self, title, initial=""):
+        dlg = Gtk.Dialog(title=title, transient_for=self, modal=True)
+        dlg.add_buttons("_Cancel", Gtk.ResponseType.CANCEL, "_OK", Gtk.ResponseType.OK)
+        entry = Gtk.Entry(text=initial, activates_default=True, margin=12)
+        dlg.get_content_area().add(entry)
+        dlg.set_default_response(Gtk.ResponseType.OK)
+        dlg.show_all()
+        resp = dlg.run()
+        text = entry.get_text().strip()
+        dlg.destroy()
+        return text if resp == Gtk.ResponseType.OK and text else None
+
+    def _pl_new(self, *_):
+        name = self._ask_name("New playlist")
+        if not name:
+            return
+        _cur, pls = self._current_playlist()
+        pls.setdefault(name, {"items": [], "shuffle": False})
+        self._save_playlists(pls)
+        self.pl_combo.append(name, name)
+        self.pl_combo.set_active_id(name)
+        self._refresh_targets()
+
+    def _pl_rename(self, *_):
+        old, pls = self._current_playlist()
+        if not old:
+            return
+        new = self._ask_name("Rename playlist", old)
+        if not new or new == old:
+            return
+        pls[new] = pls.pop(old)
+        cfg = cli.load_config()
+        cfg["playlists"] = pls
+        if cfg.get("playback", {}).get("playlist") == old:
+            cfg["playback"]["playlist"] = new
+        for r in cfg.get("rules", {}).get("conditions", []):
+            if r.get("target") == "playlist:" + old:
+                r["target"] = "playlist:" + new
+        if cfg.get("rules", {}).get("otherwise") == "playlist:" + old:
+            cfg["rules"]["otherwise"] = "playlist:" + new
+        cli.save_config(cfg)
+        self._refresh_play_page()
+        self.pl_combo.set_active_id(new)
+
+    def _pl_delete(self, *_):
+        name, pls = self._current_playlist()
+        if not name:
+            return
+        dlg = Gtk.MessageDialog(transient_for=self, modal=True, message_type=Gtk.MessageType.QUESTION,
+                                buttons=Gtk.ButtonsType.OK_CANCEL, text="Delete the playlist “%s”?" % name)
+        dlg.format_secondary_text("The clips stay on the screen and in your library.")
+        resp = dlg.run()
+        dlg.destroy()
+        if resp == Gtk.ResponseType.OK:
+            pls.pop(name, None)
+            self._save_playlists(pls)
+            self.pl_combo.set_active(-1)
+            self._refresh_play_page()
+
+    def _pl_add_dialog(self, *_):
+        name, pls = self._current_playlist()
+        if not name:
+            name = self._ask_name("New playlist")
+            if not name:
+                return
+            pls.setdefault(name, {"items": [], "shuffle": False})
+            self._save_playlists(pls)
+            self._refresh_play_page()
+            self.pl_combo.set_active_id(name)
+        dlg = Gtk.Dialog(title="Add clips to “%s”" % name, transient_for=self, modal=True)
+        dlg.set_default_size(520, 520)
+        dlg.add_buttons("_Cancel", Gtk.ResponseType.CANCEL, "_Add", Gtk.ResponseType.OK)
+        lb = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE)
+        checks = []
+        for title, entries in (("On your screen", [("screen", f) for f in self._screen_files()]),
+                               ("In your library (uploaded when added)",
+                                [("library", p) for p in library.list_files(self._library_path())])):
+            h = Gtk.Label(xalign=0, margin=6)
+            h.set_markup("<b>%s</b>" % title)
+            r = Gtk.ListBoxRow(activatable=False)
+            r.add(h)
+            lb.add(r)
+            for kind, val in entries:
+                cb = Gtk.CheckButton(label=os.path.basename(val).split(".h264_")[0], margin_start=12)
+                r = Gtk.ListBoxRow()
+                r.add(cb)
+                lb.add(r)
+                checks.append((cb, kind, val))
+        sc = Gtk.ScrolledWindow(vexpand=True)
+        sc.add(lb)
+        dlg.get_content_area().pack_start(sc, True, True, 0)
+        dlg.show_all()
+        resp = dlg.run()
+        chosen = [(k, v) for cb, k, v in checks if cb.get_active()]
+        dlg.destroy()
+        if resp != Gtk.ResponseType.OK or not chosen:
+            return
+        w, h = self.screen
+
+        def op():
+            names = []
+            uploads = [v for k, v in chosen if k == "library"]
+            with Device() as d:
+                existing = set(os.path.basename(f.get("path", "")) for k in ("media", "presets")
+                               for f in d.file_list().get(k, []))
+                for k, v in chosen:
+                    if k == "screen":
+                        names.append(v)
+                        continue
+                    dev_name = media.device_name(v, w, h)
+                    if dev_name not in existing:
+                        dev_name, data = media.convert(v, w, h)
+                        d.upload(dev_name, data)
+                    names.append(dev_name)
+            return names, len(uploads)
+
+        def done(res):
+            names, uploaded = res
+            cfg = cli.load_config()
+            pl = cfg.setdefault("playlists", {}).setdefault(name, {"items": [], "shuffle": False})
+            pl["items"] += [{"file": n, "repeats": 1} for n in names]
+            cli.save_config(cfg)
+            self.status.set_text("Added %d clip(s) to %s%s." % (len(names), name,
+                                 (", uploaded %d from your library" % uploaded) if uploaded else ""))
+            self.refresh()
+
+        self.run(op, done, "Adding clips to %s…" % name)
+
+    def _pl_play(self, *_):
+        name = self.pl_combo.get_active_text()
+        if not name:
+            self.show_error("Create a playlist first.")
+            return
+        cli.set_playback("playlist", name)
+        self._ensure_service()
+        self._refresh_play_page()
+        self.status.set_text("Playing playlist %s." % name)
+
+    def _refresh_targets(self):
+        for row in self._rule_rows:
+            cur = row["target"].get_active_id()
+            self._fill_target_combo(row["target"], cur)
+        self._fill_target_combo(self.otherwise_combo, self.otherwise_combo.get_active_id())
+
+    # ----- rules
+
+    def _add_rule_row(self, rule):
+        box = Gtk.Box(spacing=6)
+        box.pack_start(Gtk.Label(label="When"), False, False, 0)
+        metric = _narrow(_combo(list(player.RULE_METRICS.items()), rule.get("metric", "cpu-temp")), 11)
+        box.pack_start(metric, False, False, 0)
+        op = _combo([("above", "is above"), ("below", "is below")], "below" if "below" in rule else "above")
+        box.pack_start(op, False, False, 0)
+        val = Gtk.SpinButton.new_with_range(0, 120, 1)
+        val.set_width_chars(3)
+        val.set_value(rule.get("above", rule.get("below", 75)))
+        box.pack_start(val, False, False, 0)
+        box.pack_start(Gtk.Label(label="→ play"), False, False, 0)
+        target = _narrow(Gtk.ComboBoxText(), 14)
+        self._fill_target_combo(target, rule.get("target"))
+        box.pack_start(target, True, True, 0)
+        rm = Gtk.Button.new_from_icon_name("list-remove-symbolic", Gtk.IconSize.BUTTON)
+        row = {"box": box, "metric": metric, "op": op, "value": val, "target": target}
+        rm.connect("clicked", lambda *_: self._remove_rule_row(row))
+        box.pack_start(rm, False, False, 0)
+        self.rule_box.pack_start(box, False, False, 0)
+        box.show_all()
+        self._rule_rows.append(row)
+
+    def _remove_rule_row(self, row):
+        self.rule_box.remove(row["box"])
+        self._rule_rows.remove(row)
+
+    def _save_rules(self, turn_on):
+        conds = []
+        for row in self._rule_rows:
+            t = row["target"].get_active_id()
+            if not t:
+                self.show_error("Every rule needs something to play.")
+                return
+            conds.append({"metric": row["metric"].get_active_id(), row["op"].get_active_id(): row["value"].get_value(),
+                          "target": t})
+        cfg = cli.load_config()
+        cfg["rules"] = {"conditions": conds, "otherwise": self.otherwise_combo.get_active_id(),
+                        "hold": self.hold_spin.get_value(), "hysteresis": self.hyst_spin.get_value()}
+        cli.save_config(cfg)
+        if turn_on:
+            cli.set_playback("rules")
+            self._ensure_service()
+            self._refresh_play_page()
+        self.status.set_text("Rules saved%s." % (" and automation turned on" if turn_on else ""))
 
     # -------------------------------------------------------------- cooler --
 

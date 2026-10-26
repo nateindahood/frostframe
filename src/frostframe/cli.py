@@ -12,6 +12,7 @@ from . import __version__
 from . import labels as L
 from . import library
 from . import media
+from . import player
 from .device import Device, DeviceError, find_devices
 
 CONFIG_DIR = os.path.join(os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config")), "frostframe")
@@ -145,6 +146,7 @@ def cmd_upload(args):
         dev.upload(name, data, progress=progress_bar)
         print("Uploaded as %s" % name)
         if args.play:
+            set_playback("manual")
             play(dev, name, side=args.side if args.half else None)
             print("Now playing.")
 
@@ -163,6 +165,7 @@ def play(dev, name, side=None, loop="Single"):
 
 
 def cmd_play(args):
+    set_playback("manual")
     loop = {"single": "Single", "all": "MediaAll", "random": "MediaRand",
             "presets": "PresetAll", "random-presets": "PresetRand"}[args.loop]
     with open_device(args) as dev:
@@ -293,15 +296,41 @@ def cmd_labels(args):
         print("Labels cleared.")
 
 
+STATE_FILE = os.path.join(os.environ.get("XDG_CACHE_HOME", os.path.expanduser("~/.cache")), "frostframe",
+                          "state.json")
+
+
+def set_playback(mode, playlist=None):
+    """mode: manual (you pick files), playlist, or rules. The monitor service follows this."""
+    cfg = load_config()
+    pb = cfg.setdefault("playback", {})
+    pb["mode"] = mode
+    if playlist is not None:
+        pb["playlist"] = playlist
+    save_config(cfg)
+
+
+def service_running():
+    import subprocess
+    return subprocess.run(["systemctl", "--user", "is-active", "--quiet", "frostframe-monitor.service"]).returncode == 0
+
+
 def cmd_monitor(args):
+    from . import player
     from .sensors import Sensors
     sensors = Sensors()
     stop = []
     signal.signal(signal.SIGTERM, lambda *a: stop.append(1))
     cfg_mtime = None
-    layout = {}
+    cfg = {}
     sent_layout = False
     size = (2240, 1080)
+    sizes = {}                 # device file name -> size, refreshed periodically
+    files_at = 0.0
+    last_sent = None           # file we last told the screen to play
+    dev_holder = {}
+    durations = player.Durations(lambda name, limit=None: dev_holder["dev"].pull(name, limit=limit))
+    engine = player.Engine(lambda f: durations.get(f, sizes.get(f, 0)))
     print("frostframe monitor running (Ctrl+C to stop)")
     try:
         while not stop:
@@ -310,25 +339,234 @@ def cmd_monitor(args):
             except OSError:
                 m = None
             if m != cfg_mtime:
-                cfg_mtime, layout, sent_layout = m, load_config().get("layout", {}), False
+                cfg_mtime, cfg, sent_layout = m, load_config(), False
+            layout = cfg.get("layout", {})
+            mode = cfg.get("playback", {}).get("mode", "manual")
             readings = sensors.read()
-            if layout.get("metrics"):
+            state = {"mode": mode}
+            if layout.get("metrics") or mode != "manual":
                 try:
                     with Device(args.device, timeout=3) as dev:
-                        if not sent_layout:
-                            size = dev.screen_size()
-                            dev.set_run_config(L.build_run_config(layout, *size))
-                            sent_layout = True
-                        dev.update_labels(L.values_update(layout, readings))
+                        dev_holder["dev"] = dev
+                        if mode != "manual":
+                            if time.monotonic() - files_at > 30 or not sizes:
+                                fl = dev.file_list()
+                                sizes = {os.path.basename(f.get("path", "")): f.get("size", 0)
+                                         for k in ("media", "presets") for f in fl.get(k, [])}
+                                files_at = time.monotonic()
+                                if last_sent is None:
+                                    last_sent = dev.user_config().get("work", {}).get("single_file")
+                            want = engine.tick(cfg, readings, set(sizes))
+                            state = dict(engine.state)
+                            if want and want != last_sent:
+                                play(dev, want)
+                                last_sent = want
+                                if args.verbose:
+                                    print("  now playing %s" % want)
+                        else:
+                            engine.tick(cfg, readings, set())
+                            last_sent = None
+                        if layout.get("metrics"):
+                            if not sent_layout:
+                                size = dev.screen_size()
+                                dev.set_run_config(L.build_run_config(layout, *size))
+                                sent_layout = True
+                            dev.update_labels(L.values_update(layout, readings))
                 except DeviceError as e:
                     sent_layout = False  # re-send the layout once the device is back
+                    state["error"] = str(e)
                     if args.verbose:
                         print("  %s" % e, file=sys.stderr)
+                finally:
+                    dev_holder.pop("dev", None)
+            _write_state(state, readings)
             time.sleep(args.interval)
     except KeyboardInterrupt:
         pass
     finally:
         sensors.close()
+
+
+def _write_state(state, readings):
+    try:
+        os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
+        out = dict(state, time=time.time(), readings={k: v for k, v in readings.items() if k in
+                                                      ("cpu-temp", "cpu-load", "gpu-temp", "gpu-load", "ram")})
+        with open(STATE_FILE + ".tmp", "w") as f:
+            json.dump(out, f)
+        os.replace(STATE_FILE + ".tmp", STATE_FILE)
+    except OSError:
+        pass
+
+
+def read_state():
+    try:
+        with open(STATE_FILE) as f:
+            st = json.load(f)
+        return st if time.time() - st.get("time", 0) < 10 else None
+    except (OSError, ValueError):
+        return None
+
+
+# ------------------------------------------------------- playlists & rules ---
+
+def parse_target(dev, cfg, text):
+    """'playlist:NAME', 'file:NAME', or a bare playlist name / file name or prefix."""
+    if text.startswith("playlist:"):
+        if text[9:] not in cfg.get("playlists", {}):
+            raise DeviceError("no playlist named %r" % text[9:])
+        return text
+    if text.startswith("file:"):
+        return "file:" + resolve_file(dev, text[5:])
+    if text in cfg.get("playlists", {}):
+        return "playlist:" + text
+    return "file:" + resolve_file(dev, text)
+
+
+def describe_target(t):
+    return ("playlist %s" % t[9:]) if t.startswith("playlist:") else t[5:] if t.startswith("file:") else str(t)
+
+
+def resolve_or_upload(dev, item):
+    """A file on the screen, or a library file (uploaded on the fly). Returns the device name."""
+    try:
+        return resolve_file(dev, item)
+    except DeviceError:
+        path = item if os.path.isfile(item) else os.path.join(library.library_dir(load_config()), item)
+        if not os.path.isfile(path):
+            raise
+        w, h = dev.screen_size()
+        print("  uploading %s from your library..." % os.path.basename(path))
+        name, data = media.convert(path, w, h)
+        dev.upload(name, data)
+        return name
+
+
+def _parse_items(dev, specs):
+    items = []
+    for spec in specs:
+        name, _, reps = spec.rpartition(":") if ":" in spec and spec.rsplit(":", 1)[1].isdigit() else (spec, "", "1")
+        items.append({"file": resolve_or_upload(dev, name), "repeats": max(1, int(reps or 1))})
+    return items
+
+
+def cmd_playlist(args):
+    cfg = load_config()
+    pls = cfg.setdefault("playlists", {})
+    if args.action == "list":
+        if not pls:
+            print("No playlists yet. Create one: frostframe playlist create NAME FILE[:repeats]...")
+        for name, pl in pls.items():
+            print("%s (%d items, %s)" % (name, len(pl.get("items", [])), "shuffle" if pl.get("shuffle") else "in order"))
+        return
+    if not args.name:
+        raise DeviceError("give a playlist name")
+    if args.action in ("create", "add"):
+        if not args.items:
+            raise DeviceError("give one or more files: NAME or NAME:repeats (from the screen or your library)")
+        with open_device(args) as dev:
+            items = _parse_items(dev, args.items)
+        cfg = load_config()
+        pls = cfg.setdefault("playlists", {})
+        if args.action == "create":
+            pls[args.name] = {"items": items, "shuffle": args.shuffle}
+        else:
+            pls.setdefault(args.name, {"items": [], "shuffle": args.shuffle})["items"] += items
+        save_config(cfg)
+        print("Playlist %s: %d items" % (args.name, len(pls[args.name]["items"])))
+    elif args.action == "show":
+        pl = pls.get(args.name) or {}
+        print("%s (%s):" % (args.name, "shuffle" if pl.get("shuffle") else "in order"))
+        for i, it in enumerate(pl.get("items", []), 1):
+            print("  %d. %s  x%d" % (i, it["file"], it.get("repeats", 1)))
+    elif args.action == "delete":
+        pls.pop(args.name, None)
+        save_config(cfg)
+        print("Deleted playlist %s" % args.name)
+    elif args.action == "play":
+        if args.name not in pls:
+            raise DeviceError("no playlist named %r" % args.name)
+        if args.shuffle:
+            pls[args.name]["shuffle"] = True
+            save_config(cfg)
+        set_playback("playlist", args.name)
+        print("Playing playlist %s." % args.name)
+        if not service_running():
+            print("Note: playlists are run by the background service, which isn't running. Start it with "
+                  "`systemctl --user enable --now frostframe-monitor` (or keep `frostframe monitor` open).")
+
+
+def cmd_auto(args):
+    cfg = load_config()
+    rules = cfg.setdefault("rules", {"conditions": [], "hold": 10, "hysteresis": 3})
+    a = args.action
+    if a == "list":
+        mode = cfg.get("playback", {}).get("mode", "manual")
+        print("Automation is %s." % ("ON" if mode == "rules" else "off"))
+        for i, r in enumerate(rules.get("conditions", []), 1):
+            op = "above" if "above" in r else "below"
+            print("  %d. when %s is %s %s -> %s" % (i, r["metric"], op, r[op], describe_target(r["target"])))
+        print("  otherwise -> %s" % (describe_target(rules["otherwise"]) if rules.get("otherwise") else "(leave as is)"))
+        print("  hold %ss, hysteresis %s" % (rules.get("hold", 10), rules.get("hysteresis", 3)))
+        return
+    if a in ("on", "off"):
+        set_playback("rules" if a == "on" else "manual")
+        print("Automation %s." % a)
+        if a == "on" and not service_running():
+            print("Note: start the background service: systemctl --user enable --now frostframe-monitor")
+        return
+    if a == "clear":
+        rules["conditions"] = []
+    elif a == "add":
+        if len(args.values) != 4 or args.values[1] not in ("above", "below"):
+            raise DeviceError("usage: frostframe auto add METRIC above|below NUMBER TARGET   (e.g. cpu-temp above 75 Hot)")
+        metric, op, num, target = args.values
+        if metric not in player.RULE_METRICS:
+            raise DeviceError("metric must be one of: %s" % ", ".join(player.RULE_METRICS))
+        with open_device(args) as dev:
+            t = parse_target(dev, cfg, target)
+        rules.setdefault("conditions", []).append({"metric": metric, op: float(num), "target": t})
+    elif a == "otherwise":
+        if len(args.values) != 1:
+            raise DeviceError("usage: frostframe auto otherwise TARGET")
+        with open_device(args) as dev:
+            rules["otherwise"] = parse_target(dev, cfg, args.values[0])
+    elif a == "remove":
+        del rules["conditions"][int(args.values[0]) - 1]
+    elif a == "hold":
+        rules["hold"] = max(3, float(args.values[0]))
+    elif a == "hysteresis":
+        rules["hysteresis"] = max(0, float(args.values[0]))
+    save_config(cfg)
+    args.action = "list"
+    cmd_auto(args)
+
+
+def cmd_stop(args):
+    set_playback("manual")
+    print("Playlists/automation stopped; the screen keeps playing the current file.")
+
+
+def cmd_status(args):
+    st = read_state()
+    cfg = load_config()
+    mode = cfg.get("playback", {}).get("mode", "manual")
+    print("Mode: %s" % {"manual": "manual (you pick what plays)", "playlist": "playlist %s" % cfg.get("playback", {}).get("playlist"),
+                        "rules": "automation"}.get(mode, mode))
+    if not st:
+        print("Background service: not running" + ("  <- needed for playlists/automation" if mode != "manual" else ""))
+        return
+    if st.get("file"):
+        extra = ""
+        if st.get("items"):
+            extra = " (item %d/%d, play %d/%d)" % (st["item"], st["items"], st.get("repeat", 1), st.get("repeats", 1))
+        print("Playing: %s%s" % (st["file"], extra))
+    if st.get("source"):
+        print("From: %s" % describe_target(st["source"]))
+    if mode == "rules":
+        print("Rule in effect: %s" % ("#%d" % (st["rule"] + 1) if st.get("rule") is not None else "otherwise"))
+    if st.get("error"):
+        print("Last error: %s" % st["error"])
 
 
 def cmd_fan(args):
@@ -484,7 +722,7 @@ def main(argv=None):
     s.add_argument("--size", type=int, default=160, help="value text size (default 160)")
     s.set_defaults(func=cmd_labels)
 
-    s = sub.add_parser("monitor", help="keep on-screen labels updated with live readings")
+    s = sub.add_parser("monitor", help="background loop: live readings, playlists, automation")
     s.add_argument("--interval", type=float, default=1.0)
     s.add_argument("-v", "--verbose", action="store_true")
     s.set_defaults(func=cmd_monitor)
@@ -498,6 +736,21 @@ def main(argv=None):
     s = sub.add_parser("pump", help="pump speed (only if the pump is connected to the cooler)")
     s.add_argument("percent", type=int)
     s.set_defaults(func=cmd_pump)
+
+    s = sub.add_parser("playlist", help="playlists of clips (played by the background service)")
+    s.add_argument("action", choices=["list", "create", "add", "show", "play", "delete"])
+    s.add_argument("name", nargs="?")
+    s.add_argument("items", nargs="*", help="FILE or FILE:repeats (on the screen, or in your library)")
+    s.add_argument("--shuffle", action="store_true")
+    s.set_defaults(func=cmd_playlist)
+
+    s = sub.add_parser("auto", help="switch media by CPU/GPU temperature or usage")
+    s.add_argument("action", choices=["list", "add", "remove", "otherwise", "on", "off", "clear", "hold", "hysteresis"])
+    s.add_argument("values", nargs="*")
+    s.set_defaults(func=cmd_auto)
+
+    sub.add_parser("status", help="what's playing and why").set_defaults(func=cmd_status)
+    sub.add_parser("stop", help="stop playlists/automation (manual mode)").set_defaults(func=cmd_stop)
 
     sub.add_parser("cooler", help="show fan/pump config and RPM").set_defaults(func=cmd_cooler)
     sub.add_parser("dump", help="print all device settings as JSON").set_defaults(func=cmd_dump)

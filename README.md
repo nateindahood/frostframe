@@ -24,6 +24,10 @@ the same features, plus:
   **Send to screen** in one click.
 - **Preview**: select any file, in your library *or already on the screen* (built-in clips
   too), to see it animate in the preview box.
+- **Playlists**: line up clips, play them in order or shuffled, and choose how many times each
+  one plays before moving on.
+- **Automation**: switch clips by CPU/GPU temperature or usage, e.g. a calm GIF while idle and a
+  "running hot" playlist above 75 °C.
 - **Readings designer**: pick readings, any text color, size and position, and one of the four
   fonts built into the screen. The font menu shows each font as it looks, and a miniature
   of the screen shows how your readings will look before you apply them.
@@ -93,6 +97,11 @@ you still need the udev rule from `packaging/`.
 | `frostframe play --left A --right B` | Dual-screen mode, two clips side by side |
 | `frostframe play NAME --loop all\|random` | Loop through your files |
 | `frostframe rm NAME` | Delete one of your uploads |
+| `frostframe playlist create NAME CLIP[:times]... [--shuffle]` | Make a playlist (clips on the screen or in your library) |
+| `frostframe playlist play NAME` · `list` · `show NAME` · `add` · `delete` | Run and manage playlists |
+| `frostframe auto add cpu-temp above 75 "Running hot"` | Rule: play a playlist or clip when a reading crosses a limit |
+| `frostframe auto otherwise Chill` · `auto on` · `auto off` · `auto list` | Default when no rule matches; turn automation on/off |
+| `frostframe status` · `frostframe stop` | What's playing and why · back to manual |
 | `frostframe brightness 0-100` · `frostframe screen on\|off` | Display |
 | `frostframe labels set cpu-temp gpu-temp ...` | On-screen readings (1-4), see `labels list` |
 | `frostframe labels clear` | Remove on-screen readings |
@@ -107,6 +116,33 @@ Upload options: `--fit fill` (crop to fill, default), `--fit fit` (letterbox), `
 Label options: `--color white|cyan|#ff8800|...` (any RGB color), `--font roboto-regular|BitcountSingle-Regular|Orbitron-Regular|RubikGlitch-Regular`,
 `--side left|right|full`, `--size 160`. Metrics: `cpu-temp cpu-load cpu-clock gpu-temp gpu-load
 gpu-clock gpu-power ram net-down net-up time date`.
+
+## Playlists and automation
+
+The screen itself can only play one clip (or loop/shuffle all of them), so **playlists and
+automation are run by frostframe's background service** (`./install.sh --service`, or the
+*Keep readings live* switch in the GUI). It checks every second what should be playing and tells
+the screen to switch when that changes. Clip lengths are measured once and cached.
+
+```bash
+frostframe playlist create Chill cowboy_bebop:2 samurai ninja_scroll:3    # name:times
+frostframe playlist play Chill
+frostframe auto add cpu-temp above 75 "Running hot"   # a playlist or a single clip
+frostframe auto otherwise Chill
+frostframe auto on
+frostframe status
+```
+
+Automation rules are checked top to bottom; the first match wins. A condition must last for the
+*hold* time (default 10 s, `frostframe auto hold N`) before the clip changes, and a rule stays on
+until the reading moves past its limit by the *margin* (default 3, `auto hysteresis N`), so brief
+spikes don't make it flicker. Rules can use `cpu-temp`, `cpu-load`, `gpu-temp`, `gpu-load` and `ram`.
+
+Pressing **Play** on a clip (GUI or `frostframe play`) switches back to manual mode.
+
+Every clip change is a settings write to the screen (the same thing the vendor app does when you
+pick a clip). frostframe never switches faster than every 2 seconds; with very short GIFs, give
+them a repeat count (e.g. `:3`) so each one stays up a little longer.
 
 ## Good to know
 
@@ -146,6 +182,7 @@ documented in [docs/PROTOCOL.md](docs/PROTOCOL.md).
 | On-screen live readings (labels + monitor) | ✅ tested |
 | Upload (GIF/MP4/PNG/JPEG → H.264) | ✅ tested |
 | GUI (GTK 3), library, previews | ✅ tested on Cinnamon |
+| Playlists (order, shuffle, repeats) and automation rules | ✅ tested |
 | Download files from the screen | ✅ tested |
 | Fan/pump settings | ⚠️ accepted by the device; effect untested (fans on motherboard on the test system) |
 | RGB light settings, live frame streaming | 🔜 in the protocol, not implemented yet |
